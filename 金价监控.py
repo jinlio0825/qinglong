@@ -41,9 +41,12 @@ config 文件（环境变量没配时才读）:
 cron 说明: */3 = 每 3 分钟一次，如嫌频繁可改为 */5
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import time
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
@@ -198,10 +201,10 @@ def format_price_notice(price):
 
 
 def parse_bots(raw_token, raw_secret=""):
-    """解析机器人列表。
+    """解析机器人列表（DD_BOT 变量值）。
 
-    新格式：DD_BOT_TOKEN="token1#secret1&token2#secret2"，# 连接 token 与 secret，
-    & 连接多组。旧格式（纯 token + 独立 DD_BOT_SECRET）仍兼容。
+    格式："token1#secret1&token2#secret2"，# 连接 token 与 secret，
+    & 连接多组。无 # 的片段 secret 留空。
     返回 [(token, secret), ...]，非法片段跳过。
     """
     bots = []
@@ -219,33 +222,41 @@ def parse_bots(raw_token, raw_secret=""):
     return bots
 
 
-def notify_one(price, token, secret):
-    """推送单个机器人，返回 True/False。"""
-    content = format_price_notice(price)
-    try:
-        from notify import send
-    except ImportError:
-        print("未找到 notify 模块（青龙自带），跳过推送。")
-        return False
+def _dingtalk_sign(secret, timestamp):
+    """钉钉加签：HmacSHA256(timestamp\nsecret) → base64 → urlencode"""
+    import base64
+    import hashlib
+    import urllib.parse
 
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        secret.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return urllib.parse.quote_plus(base64.b64encode(hmac_code))
+
+
+def notify_one(content, token, secret):
+    """直接推钉钉机器人（不走青龙 notify 模块），返回 True/False。"""
+    url = f"https://oapi.dingtalk.com/robot/send?access_token={token}"
+    if secret:
+        url += f"&timestamp={int(time.time() * 1000)}&sign={_dingtalk_sign(secret, int(time.time() * 1000))}"
+    payload = {"msgtype": "text", "text": {"content": content}}
     try:
-        send(
-            title="金价",
-            content=content,
-            HITOKOTO="false",
-            DD_BOT_SECRET=secret,
-            DD_BOT_TOKEN=token,
-        )
+        resp = requests.post(url, json=payload, timeout=15).json()
     except Exception as exc:
         print(f"钉钉推送失败：{exc}")
         return False
-
+    if resp.get("errcode") != 0:
+        print(f"钉钉推送失败：{resp.get('errmsg')} (errcode={resp.get('errcode')})")
+        return False
     print("钉钉推送成功。")
     return True
 
 
 def notify_current_price(price, token="", secret=""):
-    """打印金价，配置齐全时才推钉钉（支持多机器人）。
+    """打印金价，DD_BOT 配置齐全时才推钉钉（支持多机器人）。
 
     返回 True 表示至少一台发送成功，False 表示未配置或全部失败（均不抛异常）。
     """
@@ -254,11 +265,11 @@ def notify_current_price(price, token="", secret=""):
 
     bots = parse_bots(token, secret)
     if not bots:
-        print("未配置钉钉机器人，跳过推送。")
-        print("配置方式：环境变量或 /ql/data/config/config.yaml，详见本文件头部说明。")
+        print("未配置钉钉机器人（变量 DD_BOT），跳过推送。")
+        print("配置方式：DD_BOT=token1#secret1&token2#secret2")
         return False
 
-    results = [notify_one(price, t, s) for t, s in bots]
+    results = [notify_one(content, t, s) for t, s in bots]
     return any(results)
 
 
