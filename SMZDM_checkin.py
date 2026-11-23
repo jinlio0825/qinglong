@@ -1,6 +1,8 @@
 """
+任务名称
+name: 什么值得买 每日签到
+定时规则
 cron: 39 17 * * *
-new Env('什么值得买签到')
 """
 
 import requests, json, time, hashlib, os, random, re
