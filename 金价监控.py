@@ -12,8 +12,11 @@ cron: */3 * * * *
       本地打印 + 推送钉钉机器人（配置齐全时才推送）
 
 环境变量（优先）:
-    DD_BOT_TOKEN    钉钉机器人 access_token
-    DD_BOT_SECRET   钉钉机器人加签密钥（SEC 开头）
+    DD_BOT_TOKEN    钉钉机器人，支持多机器人：
+                    单个: token#secret（# 连接 token 与加签密钥）
+                    多个: token1#secret1&token2#secret2（& 连接多组）
+                    旧格式（纯 token，secret 走 DD_BOT_SECRET）仍兼容
+    DD_BOT_SECRET   钉钉机器人加签密钥（SEC 开头，单机器人时用）
     JD_GOLD_SKU     京东金融积存金 productSku（可选，默认 1961543816）
 
 config 文件（环境变量没配时才读）:
@@ -39,6 +42,7 @@ cron 说明: */3 = 每 3 分钟一次，如嫌频繁可改为 */5
 
 import json
 import os
+import re
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
@@ -189,21 +193,31 @@ def format_price_notice(price):
     return f"京东买入价：{price:.2f}\n卖出价：{buyback_price:.2f}"
 
 
-def notify_current_price(price, token="", secret=""):
-    """打印金价，配置齐全时才推钉钉。
+def parse_bots(raw_token, raw_secret=""):
+    """解析机器人列表。
 
-    返回 True 表示已发送，False 表示未配置或发送失败（均不抛异常）。
+    新格式：DD_BOT_TOKEN="token1#secret1&token2#secret2"，# 连接 token 与 secret，
+    & 连接多组。旧格式（纯 token + 独立 DD_BOT_SECRET）仍兼容。
+    返回 [(token, secret), ...]，非法片段跳过。
     """
+    bots = []
+    for group in re.split(r"&", raw_token or ""):
+        group = group.strip()
+        if not group:
+            continue
+        if "#" in group:
+            token, _, secret = group.partition("#")
+            token, secret = token.strip(), secret.strip()
+        else:
+            token, secret = group, (raw_secret or "").strip()
+        if token:
+            bots.append((token, secret))
+    return bots
+
+
+def notify_one(price, token, secret):
+    """推送单个机器人，返回 True/False。"""
     content = format_price_notice(price)
-    print(content)
-
-    if not (token and secret):
-        missing = [name for name, value in
-                   (("DD_BOT_TOKEN", token), ("DD_BOT_SECRET", secret)) if not value]
-        print("未配置钉钉机器人（缺 %s），跳过推送。" % "、".join(missing))
-        print("配置方式：环境变量或 /ql/data/config/config.yaml，详见本文件头部说明。")
-        return False
-
     try:
         from notify import send
     except ImportError:
@@ -224,6 +238,24 @@ def notify_current_price(price, token="", secret=""):
 
     print("钉钉推送成功。")
     return True
+
+
+def notify_current_price(price, token="", secret=""):
+    """打印金价，配置齐全时才推钉钉（支持多机器人）。
+
+    返回 True 表示至少一台发送成功，False 表示未配置或全部失败（均不抛异常）。
+    """
+    content = format_price_notice(price)
+    print(content)
+
+    bots = parse_bots(token, secret)
+    if not bots:
+        print("未配置钉钉机器人，跳过推送。")
+        print("配置方式：环境变量或 /ql/data/config/config.yaml，详见本文件头部说明。")
+        return False
+
+    results = [notify_one(price, t, s) for t, s in bots]
+    return any(results)
 
 
 def main():
