@@ -376,25 +376,34 @@ def qd_para(obj):
     key = RSA.import_key(QD_PUB_PEM)
     return binascii.hexlify(PKCS1_v1_5.new(key).encrypt(obj.encode())).decode()
 
-# 话费兑换的去重记录文件。青龙里脚本目录可能只读，写失败不影响主流程。
-CT_HUAFEI_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "电信金豆换话费.log")
+# 话费兑换的去重记录（内容是 JSON，不是日志，故用 .json）。
+# 记录「哪个号兑过哪个面额」，防止重复兑换。
+# 青龙里脚本目录可能只读，写失败不影响主流程。
+CT_HUAFEI_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "chinaTelecom_huafei_state.json")
+# 旧版本用 .log 后缀存同一份数据，保留读取以兼容已运行的机器
+CT_HUAFEI_LOG_LEGACY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "电信金豆换话费.log")
 
 
 def huafei_log_read():
-    try:
-        with open(CT_HUAFEI_LOG, encoding="utf-8") as fr:
-            return json.load(fr)
-    except Exception:
-        return {}
+    for path in (CT_HUAFEI_STATE, CT_HUAFEI_LOG_LEGACY):
+        try:
+            with open(path, encoding="utf-8") as fr:
+                return json.load(fr)
+        except Exception:
+            continue
+    return {}
 
 
 def huafei_log_write(data):
-    try:
-        with open(CT_HUAFEI_LOG, "w", encoding="utf-8") as fw:
-            json.dump(data, fw, ensure_ascii=False)
-    except Exception:
-        pass
+    for path in (CT_HUAFEI_STATE, CT_HUAFEI_LOG_LEGACY):
+        try:
+            with open(path, "w", encoding="utf-8") as fw:
+                json.dump(data, fw, ensure_ascii=False)
+            return
+        except Exception:
+            continue
 
 
 def mod_jinyu():
@@ -2927,6 +2936,48 @@ def mod_huafei():
             await asyncio.sleep(1)
         await asyncio.gather(*tasks)
 
+    # ---- def fetch_goods_list ----
+    async def fetch_goods_list(session, masked_phone):
+        """拉金豆商城商品列表，返回 (goods_list, last_resp)。
+
+        服务端 getGoodsList 偶发返回 code=999999 / biz=None（脚本 2302 行注释
+        也记录过该现象）。单次请求失败会让 jp 为空、后面 20 轮全空转，
+        所以这里做【多次重试 + 参数降级】：
+          第 1 组 完整参数
+          第 2 组 去掉 tabOrder（空值传参可能被服务端判为非法）
+          第 3 组 只留分页
+        全部失败时返回 ([], 最后一次响应)，由调用方决定中止。
+        """
+        base = 'https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList'
+        variants = [
+            ('floorType=0&userType=1&page=1&order=3&tabOrder=', '完整参数'),
+            ('floorType=0&userType=1&page=1&order=3', '去 tabOrder'),
+            ('page=1', '仅分页'),
+        ]
+        last_resp = None
+        for attempt, (qs, desc) in enumerate(variants, 1):
+            if attempt > 1:
+                await asyncio.sleep(1)
+            try:
+                resp = await session.get(f'{base}?{qs}')
+                data = await resp.json()
+            except Exception as e:
+                last_resp = f'{type(e).__name__}: {e}'
+                print_time_log(f"📱{masked_phone} 商品列表[{desc}]请求异常: {last_resp}")
+                continue
+
+            biz = data.get('biz') if isinstance(data, dict) else None
+            goods = (biz or {}).get('ExchangeGoodslist')
+            if isinstance(goods, list):
+                print_time_log(f"📱{masked_phone} 商品列表[{desc}]拉到 {len(goods)} 个商品"
+                               + ('' if attempt == 1 else f'（第 {attempt} 组参数）'))
+                return goods, data
+
+            last_resp = data
+            print_time_log(f"📱{masked_phone} 商品列表[{desc}]失败: {str(data)[:160]}")
+
+        return [], last_resp
+
     # ---- def aes_ecb_encrypt ----
     def aes_ecb_encrypt(plaintext, key):
         key = key.encode('utf-8')
@@ -2998,23 +3049,24 @@ def mod_huafei():
                     amountTotal = r_json["biz"]["amountTotal"]
                     print_time_log(f'📱{masked_phone} 金豆余额：{amountTotal} 个~ ✨')
 
-                    queryBigDataAppGetOrInfo = await s.get('https://wapact.189.cn:9001/gateway/golden/goldGoods/getGoodsList?floorType=0&userType=1&page=1&order=3&tabOrder=')
-                    queryBigDataAppGetOrInfo_json = await queryBigDataAppGetOrInfo.json()
+                    goods_list, last_goods_resp = await fetch_goods_list(s, masked_phone)
 
-                    if (isinstance(queryBigDataAppGetOrInfo_json, dict)
-                            and queryBigDataAppGetOrInfo_json.get("biz")
-                            and "ExchangeGoodslist" in queryBigDataAppGetOrInfo_json["biz"]):
-                        for i in queryBigDataAppGetOrInfo_json["biz"]["ExchangeGoodslist"]:
-                            if '话费' not in i["title"]:
-                                continue
-                            for j in morning_exchanges:
-                                if j in i["title"]:
-                                    jp["9"][j] = i["id"]
-                            for j in afternoon_exchanges:
-                                if j in i["title"]:
-                                    jp["13"][j] = i["id"]
-                    else:
-                        print_time_log(f"📱{masked_phone} 获取商品列表失败啦~ 返回: {str(queryBigDataAppGetOrInfo_json)[:200]}")
+                    if not goods_list:
+                        print_time_log(
+                            f"📱{masked_phone} ❌ 商品列表三个参数组合均失败，"
+                            f"无法确定可兑换商品，跳过本账号（不再空转 {OUTER_LOOP_COUNT} 轮）")
+                        print_time_log(f"     最后一次响应: {str(last_goods_resp)[:200]}")
+                        return
+
+                    for i in goods_list:
+                        if '话费' not in i.get("title", ""):
+                            continue
+                        for j in morning_exchanges:
+                            if j in i["title"]:
+                                jp["9"][j] = i["id"]
+                        for j in afternoon_exchanges:
+                            if j in i["title"]:
+                                jp["13"][j] = i["id"]
 
                     h = get_network_time().hour
                     if 11 > h:
@@ -3032,6 +3084,19 @@ def mod_huafei():
                     for di in sorted(d.keys(), key=lambda x: float(x.replace('元话费', '')), reverse=True):
                         if phone not in dhjl[yf].get(di, set()):  # 用集合快速判断
                             valid_products.append(di)
+
+                    # ---- 商品列表拉到了，但没有本次场次的目标面额 ----
+                    if not valid_products:
+                        if not d:
+                            print_time_log(
+                                f"📱{masked_phone} ⏭️  商品列表里没有 {h} 点场次的目标面额"
+                                f"（目标: {morning_exchanges if h == 9 else afternoon_exchanges}），"
+                                f"跳过本账号")
+                        else:
+                            print_time_log(
+                                f"📱{masked_phone} ⏭️  目标面额本月已全部兑换过"
+                                f"（{', '.join(d.keys())}），跳过本账号")
+                        return
 
                     # ---- 场次时间判断：非场次直接跳过，不空转 ----
                     now_ts = get_network_time().timestamp()
@@ -3114,7 +3179,12 @@ def mod_huafei():
                     ticket = get_ticket(phone, load_token[phone]['userId'], load_token[phone]['token'])
 
                 if not ticket:
-                    print_time_log(f'📱{masked_phone} 用密码登录啦~ 🔑')
+                    # userLoginNormal 内部优先走 Token 模式，日志文案要如实反映
+                    _tk_chk, _uid_chk = get_token_for(phone)
+                    if _tk_chk:
+                        print_time_log(f'📱{masked_phone} 用 Token 登录啦~ 🔑')
+                    else:
+                        print_time_log(f'📱{masked_phone} 用密码登录啦~ 🔑')
                     ticket = userLoginNormal(phone, password)
 
                 if ticket:
@@ -3136,36 +3206,10 @@ def mod_huafei():
     +--------------------------------------------------------------------+
     '''
 
-    current_month = get_network_time().strftime("%Y%m")
-
     try:
         dhjl = huafei_log_read()
     except FileNotFoundError:
         dhjl = {}
-
-    dhjl2 = {}
-
-    if current_month in dhjl:
-        records = dhjl[current_month]
-        for fee, phones in records.items():
-            if isinstance(phones, list):
-                phone_list = phones
-            else:
-                phone_list = phones.strip('#').split('#')
-            for phone in phone_list:
-                if phone not in dhjl2:
-                    dhjl2[phone] = {}
-                if current_month not in dhjl2[phone]:
-                    dhjl2[phone][current_month] = []
-                dhjl2[phone][current_month].append(fee)
-
-    try:
-        _hf2 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            '电信金豆换话费2.log')
-        with open(_hf2, 'w', encoding='utf-8') as fw:
-            json.dump(dhjl2, fw, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
 
     current_time = get_network_time()
 
