@@ -12,11 +12,12 @@ cron: */3 * * * *
       本地打印 + 推送钉钉机器人（配置齐全时才推送）
 
 环境变量（优先）:
-    DD_BOT_TOKEN    钉钉机器人，支持多机器人：
+    DD_BOT          金价监控专用钉钉机器人，支持多个：
                     单个: token#secret（# 连接 token 与加签密钥）
                     多个: token1#secret1&token2#secret2（& 连接多组）
-                    旧格式（纯 token，secret 走 DD_BOT_SECRET）仍兼容
-    DD_BOT_SECRET   钉钉机器人加签密钥（SEC 开头，单机器人时用）
+                    注意与青龙全局通知的 DD_BOT_TOKEN 区分开，本脚本优先读 DD_BOT
+    DD_BOT_TOKEN    青龙全局通知的机器人（纯 token，兼容读取但可能与全局通知冲突，建议用 DD_BOT）
+    DD_BOT_SECRET   钉钉机器人加签密钥（SEC 开头）
     JD_GOLD_SKU     京东金融积存金 productSku（可选，默认 1961543816）
 
 config 文件（环境变量没配时才读）:
@@ -59,8 +60,8 @@ QL_CONFIG_CANDIDATES = (
 # 脚本同目录配置文件
 LOCAL_CONFIG_CANDIDATES = ("config.json",)
 
-# 需要从配置里取的键
-CONFIG_KEYS = ("DD_BOT_TOKEN", "DD_BOT_SECRET", "JD_GOLD_SKU")
+# 需要从配置里取的键（DD_BOT 是本脚本专用变量，避免与青龙全局通知的 DD_BOT_TOKEN 冲突）
+CONFIG_KEYS = ("DD_BOT", "DD_BOT_TOKEN", "DD_BOT_SECRET", "JD_GOLD_SKU")
 
 
 def _read_json_config(path):
@@ -120,7 +121,8 @@ def _flatten_config(raw):
 def load_config():
     """读取钉钉配置：环境变量优先，其次 config 文件，最后留空。
 
-    返回 (token, secret, sku)，缺失的键为空字符串。
+    返回 (bots_raw, secret, sku)：bots_raw 是 DD_BOT（或兼容的 DD_BOT_TOKEN）
+    原始值，由 parse_bots 解析成机器人列表。
     """
     config = {}
 
@@ -144,8 +146,10 @@ def load_config():
         if env_value not in (None, ""):
             config[key] = env_value.strip()
 
+    # DD_BOT（本脚本专用）优先；没配才兼容读全局的 DD_BOT_TOKEN
+    bots_raw = config.get("DD_BOT") or config.get("DD_BOT_TOKEN", "")
     return (
-        config.get("DD_BOT_TOKEN", ""),
+        bots_raw,
         config.get("DD_BOT_SECRET", ""),
         config.get("JD_GOLD_SKU", "") or JD_GOLD_PRODUCT_SKU,
     )
@@ -259,13 +263,13 @@ def notify_current_price(price, token="", secret=""):
 
 
 def main():
-    token, secret, sku = load_config()
+    bots_raw, secret, sku = load_config()
     try:
         price = get_jd_gold_price(sku=sku)
     except Exception as exc:
         print(f"获取京东金融金价失败：{exc}")
         return 1
-    notify_current_price(price, token, secret)
+    notify_current_price(price, bots_raw, secret)
     return 0
 
 
