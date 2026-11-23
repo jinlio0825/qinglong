@@ -15,7 +15,7 @@ cron: 16 7 * * *
 依赖: pip install requests
 
 环境变量:
-    fmz200_xxyx_token   必填, JSON 数组:
+    xxyx_token   必填, JSON 数组:
         [{"token":"xxx","username":"昵称","avatar":"头像URL"}, ...]
 
     token 获取方式: 用抓包工具抓 APP「我的」页面
@@ -31,7 +31,7 @@ import time
 
 import requests
 
-ENV_NAME = "fmz200_xxyx_token"
+ENV_NAME = "xxyx_token"
 BASE_URL = "https://xxyx-client-api.xiaoxiaoyouxuan.com"
 APP_VERSION = "20480"
 APP_UA = "XiaoXiaoYouXuan/20480 CFNetwork/3826.400.120 Darwin/24.3.0"
