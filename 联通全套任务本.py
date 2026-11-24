@@ -8648,11 +8648,13 @@ def main():
     is_friday = datetime.now().weekday() == 4
     if not query_only:
         if sc.get("run_grab_coupon", False) and globalConfig.get("enable_sign", True):
-            if hour in [9, 17] and (58 <= current_min <= 59):
+            # 定时规则配的是 57 9,17 * * *，窗口必须覆盖 57 分，
+            # 否则 9:57 启动会落进日常串行模式，账号 2-5 排队错过开抢
+            if hour in [9, 17] and (57 <= current_min <= 59):
                 grab_mode = True
         if (AH_FRIDAY_AMOUNT and is_friday and rc.get("run_ah_friday", True)
                 and globalConfig.get("enable_regional", True)
-                and hour == 9 and (58 <= current_min <= 59)):
+                and hour == 9 and (57 <= current_min <= 59)):
             ah_friday_grab = True
             grab_mode = True
     print("-" * 36)
