@@ -198,9 +198,17 @@ class AliyunUser:
         if not task:
             log(f"✅ 签到 - {group_name or 'default'}: 该社区无签到任务")
             return
-        r = self.fetch("/task/actionLog", "post", body=task)
-        msg = (r or {}).get("message") if isinstance(r, dict) else r
-        log(f"✅ 签到 - {group_name or 'default'}: {msg}")
+        # actionLog 偶发"完成任务失败"（服务端时序问题），重试 2 次
+        for attempt in range(3):
+            r = self.fetch("/task/actionLog", "post", body=task)
+            msg = (r or {}).get("message") if isinstance(r, dict) else r
+            if isinstance(r, dict) and r.get("code") == "200":
+                suffix = f"（第 {attempt + 1} 次尝试）" if attempt else ""
+                log(f"✅ 签到 - {group_name or 'default'}: {msg}{suffix}")
+                return
+            if attempt < 2:
+                self.wait()
+        log(f"⚠️ 签到 - {group_name or 'default'}: {msg}")
 
     def assess_sign_in_bonus(self, group_id, group_name):
         if not group_id:
