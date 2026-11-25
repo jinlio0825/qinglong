@@ -1507,7 +1507,13 @@ class UserService:
         return best_candidate or (cand_list[0] if cand_list else None)
 
     def sign_grab_execute(self, candidate):
+        last_0053 = False
         for i in range(1, 6):
+            # 多账号并发时, 各账号在开抢前 1 秒内加随机抖动再提交,
+            # 避免同一 IP 的请求全部落在同一毫秒(风控特征更明显)。
+            # 抖动范围 0~0.5s, 最晚 9:59:59.8 前发出, 不影响"抢在整点前提交"。
+            if i == 1:
+                time.sleep(random.uniform(0, 0.5))
             self.log(f"🔥 [第{i}次冲击] 发起兑换请求...")
             try:
                 data = {
@@ -1540,6 +1546,11 @@ class UserService:
                         # 0053 出现在"结果查询"阶段: 提交(prizeConvert)已拿到工单号,
                         # 但查询最终结果失败。此时无法断定兑换失败 —— 实测存在
                         # 券已发放但结果查询报错的情况, 必须以账户明细为准。
+                        #
+                        # 0053 的语义是"结果查询失败"而非"库存没了", 10:00:00 后
+                        # 2-3 秒内仍是黄金窗口: 先做一次到账核对(券可能已发放),
+                        # 确认没到账则不立即放弃, 继续循环补冲击(重试间隔很短,
+                        # 5 次冲击可在 3 秒内打完)。
                         msg_0053 = final_res.get('msg', '') or final_res.get('message', '未知原因')
                         self.log(f"💔 [抢兑失败] 状态: {final_status} | 提示: {msg_0053}")
                         if self.sign_verify_grab_result(self._grab_baseline_coupons,
@@ -1549,7 +1560,8 @@ class UserService:
                                                         expect_amount=candidate.get('amount')):
                             self.log(f"🎉🎉🎉 [抢兑成功] 到账核对确认券已到账：{candidate.get('name', '目标奖品')}！ 🎉🎉🎉", notify=True)
                             return True
-                        return False
+                        last_0053 = True
+                        continue
                     else:
                         err_code = str(final_res.get('data', {}).get('errorCode', '') or '')
                         msg = final_res.get('msg', '') or final_res.get('message', '未知原因')
@@ -1607,6 +1619,17 @@ class UserService:
                 time.sleep(0.2)
             except Exception as e:
                 self.log(f"❌ 抢兑异常: {str(e)}")
+        if last_0053:
+            # 5 次冲击全部 0053: 最后再做一次到账核对兜底
+            # (重试期间券可能已陆续发放, 尤其服务端结算延迟的场景)
+            self.log("⏳ [0053兜底] 全部冲击报0053, 最后核对一次卡券/明细...")
+            if self.sign_verify_grab_result(self._grab_baseline_coupons,
+                                            self._grab_baseline_count,
+                                            candidate.get('name', '目标奖品'),
+                                            "全部冲击返回 0053",
+                                            expect_amount=candidate.get('amount')):
+                self.log(f"🎉🎉🎉 [抢兑成功] 到账核对确认券已到账：{candidate.get('name', '目标奖品')}！ 🎉🎉🎉", notify=True)
+                return True
         return False
 
     def get_wocare_body(self, apiCode, requestData={}):
