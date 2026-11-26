@@ -17,7 +17,7 @@ cron: 20 8 * * *
 
 功能:
   登录验证 → 每日签到抽奖 → 成长值签到状态查询 → 开宝箱
-  → 元宝领取 + 元宝闪购兑换(可配抢购) → 挑战赛自动报名
+  → 元宝领取 + 元宝闪购兑换(可配抢购)
   → 日常任务×20 (含看广告加抽奖次数) → 抽奖×6 + 额外抽奖×2
   → 红包雨(自动选场次/等待开场/报名/抢包/广告加奖)
   → 余额≥1元 自动提现到支付宝(默认关)
@@ -138,24 +138,22 @@ BRAND_BEFORE_MS = 200                 # 开抢前提毫秒
 BRAND_INTERVAL_MS = 150               # 冲击间隔毫秒(每次提交后等 150ms 再发)
 BRAND_ATTEMPTS = 10                   # 最多冲击次数
 BRAND_WAIT_MAX_MS = 600000            # 距开抢超此毫秒则跳过(10分钟)
-BRAND_GRAB_METHOD = "VipRightsService.ReceiveBrandCard"   # 抢券动作接口
-
-# 抢券动作接口候选(抓包里没录到, 依次尝试; 命中后会自动停用其余)
-# 判断依据: SilkwormVip 下 25 个方法全是查询类, 抢券动作未出现。
-# 若全部返回 404/5xx, 请在小程序点一次「抢大牌」抓包, 把 methodName 填到上面。
-BRAND_GRAB_METHODS = [
-    "VipRightsService.ReceiveBrandCard",
-    "VipRightsService.GrabBrandCard",
-    "VipRightsService.ReceiveBrandCardPool",
-    "VipRightsService.GetBrandCard",
-]
-_GRAB_METHOD_LOCKED = False   # 是否已锁定可用的抢券接口
+# 9:30 限量抢兑的大牌券动作接口 —— 已实测确认:
+#   VipRightsService.GrabBrandCard  body={"silk_id":..., "type": 池的type}
+#   - type=1 (svip 自领券, BrandCardInfo 的池) → code=0, 返回券信息(实测领到)
+#   - type=99 (9:30 限量池, ExtraBrandCardPool 的池) → code=10001"请求参数错误"
+#     (原因待验证: 可能是已抢完/时段外/今日已抢, 明早 9:30 实测即知)
+#   - 不带 type → "invalid field Type: value '0' must be greater than '0'"
+# 券是否真到手, 一律以 GetOwnedBrandCards 卡包核验为准。
+BRAND_GRAB_METHOD = "VipRightsService.GrabBrandCard"   # 抢券接口(已实测确认)
 
 # 元宝闪购要抢的商品 exchange_id, 默认 200 = svip⚡️1元红包(4000元宝)
 # 可用 XC_YB_GOODS_ID 环境变量覆盖; 也可写多个: "200,199"
 YB_GOODS_ID = os.getenv("XC_YB_GOODS_ID", "200").strip()
 
-CITY_CODE = 4501                      # 挑战赛城市码
+# 转盘抽奖次数任务: true=逐个试探(1~20, 连续3个"参数错误"即停)
+# false=只发抓包验证过的 2/8/9/10/11
+
 RECOMMEND_ID = 12159598643            # 推荐人
 
 DD_BOT_TOKEN = ""                     # 钉钉 token, 留空不推送
@@ -273,7 +271,6 @@ class XiaocanMiniUser:
         self.session_id = acc.get("sessionId") or str(uuid.uuid4())
         self.ck_status = True
         self.red_pack_rain_done = False
-        _GRAB_METHOD_LOCKED = False      # 抢券接口是否已锁定
         # 小程序端请求头(抓包逐项对齐)
         self.headers = {
             "user-agent": UA,
@@ -460,23 +457,52 @@ class XiaocanMiniUser:
         return lst
 
     def AddLotteryTimes(self, task_type):
-        """做日常任务换抽奖次数。type 对应任务位, app_id 由 rpc 自动注入。"""
+        """做转盘抽奖次数任务。
+
+        type 是独立编号体系, 与 GetDailyTask 的 id/action_type 无关:
+          type=1  签到        type=2  分享
+          type=4  沾一沾      type=8/9/10/11  浏览类
+        type=3/5/6 不存在(服务端回"请求参数错误")。
+
+        返回 (是否成功, 服务端提示):
+          - code=0            → (True, "")
+          - 提示含"限一次"等  → (False, 提示)  有效 type 但今天已做完
+          - 提示"请求参数错误" → (False, None)  type 不存在, 应跳过
+        """
         d = self.rpc("SilkwormLottery", "SilkwormLotteryMobile.AddLotteryTimes", {
             "silk_id": self.silk_id, "type": task_type})
         st = d.get("status") or {}
         if st.get("code") == 0:
-            log(f"[任务] type={task_type} 完成, 抽奖次数+1")
-            return True
-        msg = st.get("msg") or st.get("code")
-        log(f"[任务] type={task_type} 未完成: {msg}")
-        return False
+            log(f"[抽奖次数] type={task_type} 完成, 次数+1")
+            return True, ""
+        msg = str(st.get("msg") or st.get("code") or "")
+        if "请求参数错误" in msg:
+            return False, None            # type 不存在
+        log(f"[抽奖次数] type={task_type}: {msg}")
+        return False, msg
 
     def GetLotteryInfo(self):
+        """转盘抽奖信息。
+
+        lottery_info 里的 is_xxx 字段表示该任务今天做没做, 是判断依据:
+          if_shared            分享
+          is_get_meituan_redpack / is_get_eleme_redpack   美团/饿了么红包
+          is_view_bwc_page     浏览霸王餐页
+          is_view_welfare_page 浏览福利页
+          is_view_tp_ad        看第三方广告
+          is_view_douyin_mall  浏览抖音商城
+        """
         d = self.rpc("SilkwormLottery", "SilkwormLotteryMobile.LotteryInfo", {"silk_id": self.silk_id})
         info = d.get("lottery_info") or {}
-        log(f"[抽奖额度] 幸运次数={info.get('lucky_times')} 已分享={info.get('if_shared')} "
-            f"加次数={info.get('is_add_times')}")
-        return info
+        times = d.get("lottery_times") or {}
+        log(f"[抽奖] 幸运次数={info.get('lucky_times')} | 今日抽了 {info.get('day_num')} 次")
+        not_done = []
+        for k, v in info.items():
+            if k.startswith("is_view_") or k == "if_shared":
+                if not v:
+                    not_done.append(k)
+        log(f"[抽奖] 未完成任务: {not_done if not_done else '全部已完成'}")
+        return {"lottery_info": info, "lottery_times": times}
 
     def OnAdViewed(self, bus_type):
         """看广告加抽奖次数。bus_type: 2/4 为日常任务位(APP 版 12/13 号位)。"""
@@ -542,17 +568,6 @@ class XiaocanMiniUser:
             log("[礼包] 领取成功")
             return True
         log(f"[礼包] {st.get('msg', st.get('code'))}")
-        return False
-
-    def ReceivedEverydayAward(self):
-        """每日锦鲤奖励(非锦鲤会返回 40023, 属正常)。"""
-        d = self.rpc("SilkwormMarket", "SilkwormMarketClientService.ReceivedEverydayAward",
-                     {"silk_id": self.silk_id})
-        st = d.get("status") or {}
-        if st.get("code") == 0:
-            log("[日常奖励] 领取成功")
-            return True
-        log(f"[日常奖励] {st.get('msg', st.get('code'))}")
         return False
 
     def GetLotteryProgress(self):
@@ -699,6 +714,14 @@ class XiaocanMiniUser:
             log("[大牌] 当前未持有大牌券")
         return cards
 
+    def CountOwnedBrandCards(self):
+        """卡包内大牌券数量(静默, 不打日志), 用于抢券前后对比核验。"""
+        d = self.rpc("SilkwormCard", "SilkwormCardService.GetUserCardList", {
+            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 999,
+            "card_types": [13, 3], "card_ids": None})
+        return sum(1 for it in (d.get("list") or [])
+                   if "大牌" in ((it.get("card") or {}).get("name") or ""))
+
     def GetUserTencentVipInfo(self):
         """腾讯 VIP 权益(含 grab_time/next_time, 抓包实证可用于判断抢券节奏)。"""
         d = self.rpc("SilkwormVip", "VipRightsService.UserTencentVipInfo", {"silk_id": self.silk_id})
@@ -711,30 +734,28 @@ class XiaocanMiniUser:
         return info
 
     def GrabBrandCard(self, pool=None):
-        """抢一次大牌券(单次同步提交, 供接口探测用)。
+        """抢大牌券 —— 接口已实测确认。
 
-        抢券动作接口名未能从抓包确认(SilkwormVip 下 25 个方法全是查询类),
-        因此按 BRAND_GRAB_METHODS 候选列表依次尝试, 命中即锁定。
+        VipRightsService.GrabBrandCard, body={"silk_id":..., "type": 池的type}
+          - type=1  svip 自领券(不用抢, 但同接口可领)
+          - type=99 9:30 限量抢兑券(目标)
+        成败以 GetOwnedBrandCards 卡包核验为准(接口可能只回空壳)。
         """
-        global BRAND_GRAB_METHOD, _GRAB_METHOD_LOCKED
+        global BRAND_GRAB_METHOD
         body = self._brand_grab_body(pool)
-        methods = [BRAND_GRAB_METHOD] if _GRAB_METHOD_LOCKED else list(BRAND_GRAB_METHODS)
-        for mth in methods:
-            srv = mth.split(".", 1)[0] if "." in mth else "SilkwormVip"
-            d = self.rpc(srv, mth, body, no_delay=True)
-            if not d:
-                continue
-            st = d.get("status") or {}
-            code = st.get("code")
-            if code == 0:
-                self._lock_grab_method(mth)
-                log(f"🎉 [大牌] 抢兑成功! {json.dumps(d, ensure_ascii=False)[:200]}")
-                return True
-            if code is not None and code != 404:
-                self._lock_grab_method(mth)
-                log(f"💔 [大牌] 抢兑失败: {st.get('msg') or code}")
-                return False
-        log("[大牌] 所有候选接口均无响应, 请抓包确认 methodName")
+        srv = BRAND_GRAB_METHOD.split(".", 1)[0]
+        d = self.rpc(srv, BRAND_GRAB_METHOD, body, no_delay=True)
+        if not d:
+            log("[大牌] 抢券接口无响应")
+            return False
+        st = d.get("status") or {}
+        code = st.get("code")
+        if code == 0:
+            info = d.get("info") or {}
+            exp = info.get("expired_at")
+            log(f"[大牌] 抢券受理成功 (过期时间: {exp})")
+            return True
+        log(f"[大牌] 抢券返回: {st.get('msg') or code}")
         return False
 
     def _fire_grab(self, mth, body, results, lock):
@@ -759,30 +780,16 @@ class XiaocanMiniUser:
     def GrabBrandCardAsync(self, pool=None):
         """异步打击: 到点后按固定节奏持续发包, 不等响应, 边回收结果。
 
-        与联通/APP 的同步方式不同, 这里不等上一个请求返回:
-          1. 启动线程池(默认 16 个 worker, 足以覆盖响应延迟)
-          2. 每 BRAND_INTERVAL_MS(150ms) 投递一发, 立即继续投下一发
-          3. 主线程同时收割结果, 一旦发现 code==0 立刻置停止标志并返回成功
-          4. 最多打 BRAND_ATTEMPTS 发
-
-        这样即使服务端单个响应要 500ms, 也不会阻塞后续发包 —— 16 个 worker
-        可以容纳 16 个并发在途请求, 远超 150ms 节奏下的在途数。
-        返回 True 表示抢到。
+        1. 启动线程池(16 worker)
+        2. 每 BRAND_INTERVAL_MS(150ms) 投递一发, 立即继续投下一发
+        3. 主线程同时收割结果, 一旦发现 code==0 立刻置停止标志
+        4. 最多打 BRAND_ATTEMPTS 发
+        接口名已实测锁定, 无需探测。
         """
-        global BRAND_GRAB_METHOD, _GRAB_METHOD_LOCKED
         from concurrent.futures import ThreadPoolExecutor
         import threading
 
         body = self._brand_grab_body(pool)
-        # 接口未锁定时先用一次同步探测, 确认 methodName
-        if not _GRAB_METHOD_LOCKED:
-            log("[大牌] 接口未锁定, 先同步探测一次...")
-            if self.GrabBrandCard(pool):
-                return True
-            if not _GRAB_METHOD_LOCKED:
-                log("[大牌] 候选接口全部无响应, 放弃")
-                return False
-
         mth = BRAND_GRAB_METHOD
         results = []
         lock = threading.Lock()
@@ -843,13 +850,6 @@ class XiaocanMiniUser:
             body["type"] = pool.get("type")
         return body
 
-    def _lock_grab_method(self, mth):
-        global BRAND_GRAB_METHOD, _GRAB_METHOD_LOCKED
-        if not _GRAB_METHOD_LOCKED:
-            _GRAB_METHOD_LOCKED = True
-            BRAND_GRAB_METHOD = mth
-            log(f"[大牌] 抢券接口已锁定: {mth}")
-
     def BrandCardGrabFlow(self):
         """抢大牌主流程: 查已持有 → 查可抢池 → 等开抢 → 冲击 → 核验。
 
@@ -869,19 +869,27 @@ class XiaocanMiniUser:
             REQUEST_INTERVAL = saved_interval
 
     def _brand_flow_inner(self):
-        """BrandCardGrabFlow 的实际实现(此时 REQUEST_INTERVAL 已被压到 0)。"""
-        # 1. 先看已持有, 避免重复抢
-        owned = self.GetOwnedBrandCards()
-        self.GetBrandCardInfo()
-        self.GetBrandCardExpiredTime()
+        """抢 9:30 限量大牌券(type=99)的实际流程。
 
-        # 2. 查可抢池
+        注意区分两种大牌券:
+          BrandCardInfo      type=1  svip 会员自领券, 不用抢, 与本流程无关
+          ExtraBrandCardPool type=99 9:30 限量抢兑券, 这才是要抢的
+        因此只以 ExtraBrandCardPool 的数据为准, 不再用 BrandCardInfo 判断。
+        """
+        # 1. 只查卡包做记录, 不作为"是否该抢"的依据 ——
+        #    卡包里的 svip 保底券(type=1 自领)与 9:30 限量券(type=99)是两回事,
+        #    持有保底券不代表今天限量券已抢。
+        self.GetOwnedBrandCards()
+        before_cnt = self.CountOwnedBrandCards()
+
+        # 2. 查 9:30 限量大牌券池, 只以它的数据判断
         info = self.GetExtraBrandCardPool()
         if not info:
             log("[大牌] 券池查询失败, 跳过")
             return False
-        if info.get("today_grabbed"):
-            log("[大牌] 今日已抢过, 跳过")
+        # today_grabbed / user_day_num 只反映限量券, 才是判断依据
+        if info.get("today_grabbed") or int(info.get("user_day_num") or 0) >= 1:
+            log(f"[大牌] 今日限量券已抢过 (user_day_num={info.get('user_day_num')}), 跳过")
             return False
         if not self.HasExtraBrandCardPool():
             log("[大牌] 无额外大牌券池, 跳过")
@@ -939,15 +947,14 @@ class XiaocanMiniUser:
             log(f"[大牌] 目标: {target.get('name')} (type={target.get('type')}) 已开放, 立即冲击")
 
         # 4. 异步打击: 到点后按 150ms 节奏持续发包, 不等响应, 成功即停
-        if self.GrabBrandCardAsync(target):
-            self.GetOwnedBrandCards()      # 核验到账
+        self.GrabBrandCardAsync(target)
+        # 5. 用抢前/抢后的卡包数量差核验是否真抢到
+        #    (卡包里本来就躺着 svip 保底券, 不能只看"有没有")
+        after_cnt = self.CountOwnedBrandCards()
+        if after_cnt > before_cnt:
+            log(f"🎉 [大牌] 核验通过: 卡包新增 {after_cnt - before_cnt} 张大牌券")
             return True
-
-        # 5. 全部失败: 核验一次是否实际已到账
-        log("[大牌] 全部冲击失败, 最后核验一次...")
-        if self.GetOwnedBrandCards():
-            log("🎉 [大牌] 核验到券已到账(接口报错但实际成功)")
-            return True
+        log(f"💔 [大牌] 卡包数量未变化({before_cnt} → {after_cnt}), 本次未抢到")
         self.GetUserTencentVipInfo()
         return False
 
@@ -1178,22 +1185,6 @@ class XiaocanMiniUser:
         log(f"💔 [闪购] {sent['n']} 发全部未成功 | 分布: {codes}")
         return False
 
-    # ---------- 挑战赛 ----------
-    def ListNormalPromotionsByUser(self):
-        d = self.rpc("SilkwormChallenge", "ChallengeService.ListNormalPromotionsByUser", {
-            "city_code": CITY_CODE, "silk_id": self.silk_id})
-        return d.get("promotions") or []
-
-    def CreateUserPromotion(self, promotion_id):
-        d = self.rpc("SilkwormChallenge", "ChallengeService.CreateUserPromotion", {
-            "city_code": CITY_CODE, "promotion_id": promotion_id, "silk_id": self.silk_id})
-        st = d.get("status") or {}
-        if st.get("code") == 0:
-            log(f"[挑战赛] 报名成功 id={promotion_id}")
-        else:
-            log(f"[挑战赛] 报名 id={promotion_id}: {st.get('msg', st.get('code'))}")
-
-    # ---------- 红包雨 ----------
     def GetRedPackRainEventsByDate(self, date):
         d = self.rpc("SilkwormLottery", "SilkwormLotteryMobile.GetRedPackRainEventsByDate", {
             "silk_id": self.silk_id,
@@ -1357,17 +1348,30 @@ def run_daily_account(u):
     u.SignInInfo()
     u.OpenBox()
     u.TakeGift()
-    u.ReceivedEverydayAward()
 
     # 元宝: 领取待入账 + 列表/闪购
     u.YbFlashSale()
 
-    # 元宝抽奖(先查额度, 有额度才抽, 每次消耗 200 元宝)
-    yb_info = u.YbLotteryInfo()
-    yb_limit = int((yb_info or {}).get("daily_limit") or 0)
-    yb_cost = int((yb_info or {}).get("cost") or 0)
-    if yb_limit and yb_cost and u.GetYbPoint() >= yb_cost:
-        u.YbLottery()
+    # 拉任务列表(积分任务; 元宝抽奖/元宝兑换要按这份列表判断做没做)
+    tasks = u.GetDailyTaskList()
+
+    # 元宝抽奖: 只在「元宝抽奖」任务未完成时才抽(完成就不用抽, 否则白扣元宝)
+    yb_task = next((t for t in tasks if (t.get("brief_title") or "").find("元宝抽奖") >= 0), None)
+    yb_done = False
+    if yb_task:
+        done = int(yb_task.get("completed_num") or 0)
+        limit = int(yb_task.get("limit_num") or 0)
+        yb_done = bool(limit and done >= limit)
+        log(f"[元宝抽奖] 任务进度 {done}/{limit} → {'已完成, 不抽' if yb_done else '未完成, 去抽'}")
+    else:
+        log("[元宝抽奖] 任务列表中无此项, 跳过")
+    if not yb_done:
+        yb_info = u.YbLotteryInfo()
+        yb_cost = int((yb_info or {}).get("cost") or 0)
+        if yb_cost and u.GetYbPoint() >= yb_cost:
+            u.YbLottery()
+        else:
+            log(f"[元宝抽奖] 元宝不足或未取到消耗(需 {yb_cost})")
 
     # 成长值任务(展示, 看视频类无法脚本化)
     u.GetUpgradeTask()
@@ -1375,35 +1379,35 @@ def run_daily_account(u):
     # 今日可兑商品(仅展示)
     u.TodayExchange()
 
-    # 挑战赛报名
-    try:
-        promos = u.ListNormalPromotionsByUser()
-        matched = [p for p in promos
-                   if re.search(r"5天新增2名有效团员|连续下单", p.get("description") or "")]
-        matched.append({"name": "下单挑战赛", "id": 791})
-        for p in matched:
-            log(f"[INFO] 获取「{p.get('name')}」挑战...")
-            u.CreateUserPromotion(p.get("id"))
-    except Exception as e:
-        log(f"[挑战赛] 异常: {e}")
-
-    # 拉任务列表(仅展示, 便于人工核对完成情况)
-    tasks = u.GetDailyTaskList()
-
-    # 日常任务: AddLotteryTimes 的 type 是任务位序号(1~20), 与 GetDailyTask 的 id
-    # 不是同一套编号(抓包中 type 出现 2/8/9/10/11, 而任务 id 是 1/46/47/57/58),
-    # 故按位全量提交; 12/13 号位走看广告加次数。
-    for t in range(1, 21):
-        if t == 12:
-            u.OnAdViewed(2)
-        elif t == 13:
-            u.OnAdViewed(4)
-        else:
+    # 转盘抽奖次数任务: 先查 LotteryInfo, 只做 lottery_info 里标记为未完成的任务。
+    # type 与 is_xxx 字段的对应(抓包 + 实测确认):
+    #   type=8  is_view_bwc_page     浏览霸王餐页
+    #   type=9  is_view_welfare_page 浏览福利页
+    #   type=10 is_view_tp_ad        看第三方广告
+    #   type=11 is_view_douyin_mall  浏览抖音商城
+    #   type=2  if_shared            分享
+    #   type=1  签到(type 1 与签到任务重复, 通常已完成)
+    # type=4 沾一沾 / type=3,5,6 不存在, 不主动发。
+    li = u.GetLotteryInfo()
+    info = (li or {}).get("lottery_info") or {}
+    TYPE_BY_FLAG = {
+        "is_view_bwc_page": 8,
+        "is_view_welfare_page": 9,
+        "is_view_tp_ad": 10,
+        "is_view_douyin_mall": 11,
+        "if_shared": 2,
+    }
+    todo = [(flag, t) for flag, t in TYPE_BY_FLAG.items() if not info.get(flag)]
+    if todo:
+        log(f"[抽奖次数] 待完成 {len(todo)} 项: "
+            f"{[(f, t) for f, t in todo]}")
+        for flag, t in todo:
             u.AddLotteryTimes(t)
+    else:
+        log("[抽奖次数] 所有任务今日已完成")
 
     # 抽奖: 先看进度与额度, 有多少抽多少(上限 6 次)
     u.GetLotteryProgress()
-    u.GetLotteryInfo()
     for _ in range(6):
         u.Lottery()
 
