@@ -9,7 +9,7 @@ cron: 10 8 * * *
 ==================================
 小蚕霸王餐
 ==================================
-小蚕 App 每日自动任务脚本，多账号支持，功能:
+小蚕 每日自动任务脚本，多账号支持，功能:
 
   登录验证 → 每日签到抽奖 → 开宝箱
   → 元宝领取 + 元宝闪购兑换(可配抢购) → 挑战赛自动报名
@@ -21,6 +21,16 @@ cron: 10 8 * * *
  token 过期自动检测并钉钉提醒。
  依赖: pip install requests
 
+---------- 双端模式 ----------
+同一套 RPC 协议(网关/签名/token 完全一致), 伪装成两种客户端:
+  mini (默认)   微信小程序特征: x-platform=mini, 微信 WebView UA,
+                Referer=servicewechat.com, body 注入 app_id=20,
+                默认请求间隔 3 秒(降低风控)
+  app           安卓 APP 特征: x-platform=Android, xcapp UA, body 不带 app_id,
+                默认请求间隔 1 秒
+凭证两种模式通用(x-sivir token / x-teemo silk_id / x-vayne userId 不变),
+抓 APP 或抓小程序的包都能用。
+
 ---------- 青龙面板使用 ----------
 脚本管理新建 xc.py，环境变量添加:
   XCBWC_DATA   必填, 账号 JSON 数组(见下)
@@ -30,15 +40,17 @@ cron: 10 8 * * *
   XCBWC_DATA           账号数据, JSON 数组:
                        [{"userId":"123456","teemo":"1234567","token":"eyJ...","userName":"昵称"}, ...]
                        userId = x-vayne, teemo = x-teemo(silk_id), token = x-sivir, 抓包请求头复制即可
+  XCBWC_PLATFORM       端模式: mini(默认)/app
   XCBWC_WALLET         true=余额≥1元自动提现支付宝, 默认 false 不提现
-  XCBWC_INTERVAL       请求间隔秒数, 默认 1.0 (太低可能触发风控)
-  XCBWC_BASE_URL       RPC 网关, 默认 https://gwh.xiaocantech.com/rpc
-                       3.22.x 抓包用 https://gw.xiaocantech.com/rpc
-  XCBWC_UA             User-Agent, 默认 3.18.3.6 安卓 WebView
-                       3.22.x 抓包用 XC;Android;3.22.4;
-  XCBWC_VERSION        x-version, 默认 3.18.3.6, 3.22.x 抓包用 3.22.4.6
-  XCBWC_APP_SR         x-app-sr, 3.22.x 抓包为 16, 老版不设
-  XCBWC_CHANNEL        x-channel, 3.22.x 抓包为 YYB, 老版不设
+  XCBWC_INTERVAL       请求间隔秒数, mini 模式默认 3.0, app 模式默认 1.0
+  XCBWC_BASE_URL       RPC 网关, 默认 https://gw.xiaocantech.com/rpc
+  XCBWC_UA             User-Agent, mini 模式默认微信 WebView, app 模式默认 xcapp
+  XCBWC_VERSION        x-version, mini 默认 3.22.9.93, app 默认 3.18.3.6
+  XCBWC_REFERER        mini 模式 Referer, 默认 servicewechat.com/wx52ae177248081591/824
+  XCBWC_MODEL          x-model, mini 默认 "PKR110 OnePlus", app 模式不设
+  XCBWC_APP_SR         x-app-sr, mini 默认 20, app 模式默认不设
+  XCBWC_CHANNEL        x-channel, 默认不设
+  XCBWC_APP_ID         body 注入的 app_id, mini 默认 20
   XCBWC_DD_BOT_TOKEN   钉钉机器人 access_token, 不设不推送
   XCBWC_DD_BOT_SECRET  钉钉机器人加签密钥 SEC 开头
   XCBWC_YB_FLASH_IDS   元宝闪购要抢的 exchange_id, 逗号分隔, 不设只看列表不兑换
@@ -58,22 +70,54 @@ import base64
 import hashlib
 import hmac as hmac_mod
 import random
+
+# 网关启用腾讯云 WAF 的 TLS 指纹(JA3)校验, python requests 一律 403,
+# 必须用 curl_cffi impersonate 浏览器指纹 (依赖: pip install curl_cffi)
+try:
+    from curl_cffi import requests as _curl_requests
+    HTTP_IMPERSONATE = os.getenv("XCBWC_IMPERSONATE", "chrome")
+except ImportError:
+    _curl_requests = None
+    HTTP_IMPERSONATE = None
 import requests
 
-BASE_URL = os.getenv("XCBWC_BASE_URL", "https://gwh.xiaocantech.com/rpc")
-UA = os.getenv("XCBWC_UA",
-      "Mozilla/5.0 (Linux; Android 15; PKR110 Build/AP3A.240617.008; wv) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.159 "
-      "Mobile Safari/537.36 AgentWeb/5.0.8  UCBrowser/11.6.4.950  xcapp;3.18.3.6;Android")
-X_VERSION = os.getenv("XCBWC_VERSION", "3.18.3.6")
-X_APP_SR = os.getenv("XCBWC_APP_SR", "")        # 如 16 (3.22.x 抓包)
-X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")      # 如 YYB
+BASE_URL = os.getenv("XCBWC_BASE_URL", "https://gw.xiaocantech.com/rpc")
+# 端模式: mini=微信小程序(默认) / app=安卓APP
+# 两者协议同一套(RPC 网关/签名/token 通用), 区别仅在请求头特征与 body 的 app_id 字段
+PLATFORM = os.getenv("XCBWC_PLATFORM", "mini").strip().lower()
+if PLATFORM == "mini":
+    UA = os.getenv("XCBWC_UA",
+          "Mozilla/5.0 (Linux; Android 16; PKR110 Build/AP3A.240617.008; wv) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156.0.8078.79 "
+          "Mobile Safari/537.36 XWEB/1560023 MMWEBSDK/20260902 MMWEBID/3250 "
+          "MicroMessenger/8.0.80.3220(0x280050C7) WeChat/arm64 Weixin NetType/WIFI "
+          "Language/zh_CN ABI/arm64 MiniProgramEnv/android")
+    X_VERSION = os.getenv("XCBWC_VERSION", "3.22.9.93")
+    REFERER = os.getenv("XCBWC_REFERER",
+                        "https://servicewechat.com/wx52ae177248081591/824/page-frame.html")
+    X_MODEL = os.getenv("XCBWC_MODEL", "PKR110 OnePlus")
+    X_APP_SR = os.getenv("XCBWC_APP_SR", "20")
+    X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")
+    APP_ID = int(os.getenv("XCBWC_APP_ID", "20"))
+    DEFAULT_INTERVAL = 3.0     # 小程序模式默认 3 秒/请求(降低风控)
+else:
+    UA = os.getenv("XCBWC_UA",
+          "Mozilla/5.0 (Linux; Android 15; PKR110 Build/AP3A.240617.008; wv) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.159 "
+          "Mobile Safari/537.36 AgentWeb/5.0.8  UCBrowser/11.6.4.950  xcapp;3.18.3.6;Android")
+    X_VERSION = os.getenv("XCBWC_VERSION", "3.18.3.6")
+    REFERER = os.getenv("XCBWC_REFERER", "")
+    X_MODEL = os.getenv("XCBWC_MODEL", "")
+    X_APP_SR = os.getenv("XCBWC_APP_SR", "")        # 如 16 (3.22.x 抓包)
+    X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")      # 如 YYB
+    APP_ID = 0                                      # APP 模式 body 不带 app_id
+    DEFAULT_INTERVAL = 1.0
 CITY_CODE = 4501                      # 挑战赛城市码
 DEFAULT_CITY = "330109"
 RECOMMEND_ID = 12159598643
 
 IS_WALLET = os.getenv("XCBWC_WALLET", "false") != "false"
-REQUEST_INTERVAL = float(os.getenv("XCBWC_INTERVAL", "1.0"))
+REQUEST_INTERVAL = float(os.getenv("XCBWC_INTERVAL", str(DEFAULT_INTERVAL)))
 
 # 钉钉机器人 (不设则不发)
 DD_BOT_TOKEN = os.getenv("XCBWC_DD_BOT_TOKEN", "")
@@ -183,10 +227,14 @@ class XiaocanUser:
             "x-version": X_VERSION,
             "x-vayne": self.userId,
             "x-sivir": self.token,
-            "x-platform": "Android",
+            "x-platform": "mini" if PLATFORM == "mini" else "Android",
             "x-city": self.city,
             "x-session-id": self.session_id,
         }
+        if PLATFORM == "mini":
+            self.headers["referer"] = REFERER
+        if X_MODEL:
+            self.headers["x-model"] = X_MODEL
         if X_APP_SR:
             self.headers["x-app-sr"] = X_APP_SR
         if X_CHANNEL:
@@ -205,10 +253,18 @@ class XiaocanUser:
         return {"x-ashe": ashe, "x-garen": ts, "x-nami": nami}
 
     def rpc(self, server, method, body):
+        # 小程序模式: 所有 body 统一注入 app_id=20 (抓包实证, APP 模式不带)
+        if PLATFORM == "mini" and isinstance(body, dict) and "app_id" not in body:
+            body = {**body, "app_id": APP_ID}
         headers = {**self.headers, "servername": server, "methodname": method,
                    **self._sign_headers(self.teemo, server, method)}
+        # TLS 指纹: 有 curl_cffi 用之(绕 WAF), 无则回落 requests(会被 403)
+        send = _curl_requests.post if _curl_requests else requests.post
+        kwargs = {"json": body, "headers": headers, "timeout": 20}
+        if _curl_requests:
+            kwargs["impersonate"] = HTTP_IMPERSONATE
         try:
-            r = requests.post(BASE_URL, json=body, headers=headers, timeout=20)
+            r = send(BASE_URL, **kwargs)
             if r.status_code != 200:
                 log(f"[ERROR] {method}: HTTP {r.status_code}")
                 return {}
@@ -228,7 +284,9 @@ class XiaocanUser:
             time.sleep(REQUEST_INTERVAL)
 
     def yb_rpc(self, server, method, body):
-        """元宝社区通道: H5 头"""
+        """元宝社区通道: H5 头。小程序模式下 app_id 同样注入。"""
+        if PLATFORM == "mini" and isinstance(body, dict) and "app_id" not in body:
+            body = {**body, "app_id": APP_ID}
         headers = {**self.headers,
                    "origin": "https://gw.djtaoke.cn",
                    "referer": "https://gw.djtaoke.cn/",
@@ -238,7 +296,11 @@ class XiaocanUser:
                    "methodname": method,
                    **self._sign_headers(self.teemo, server, method)}
         try:
-            r = requests.post(BASE_URL, json=body, headers=headers, timeout=20)
+            send = _curl_requests.post if _curl_requests else requests.post
+            kwargs = {"json": body, "headers": headers, "timeout": 20}
+            if _curl_requests:
+                kwargs["impersonate"] = HTTP_IMPERSONATE
+            r = send(BASE_URL, **kwargs)
             return r.json() if r.status_code == 200 else {}
         except Exception as e:
             log(f"[ERROR] {method}: {e}")
