@@ -348,6 +348,11 @@ class XiaocanUser:
         if (d.get("status") or {}).get("code") == 0:
             log(f"[广告] bus_type={bus_type} 完成")
 
+    def LotteryInfo(self):
+        """转盘抽奖信息, lucky_times 是当前可用抽奖次数。"""
+        d = self.rpc("SilkwormLottery", "SilkwormLotteryMobile.LotteryInfo", {"silk_id": self.silk_id})
+        return d.get("lottery_info") or {}
+
     def Lottery(self):
         d = self.rpc("SilkwormLottery", "SilkwormLotteryMobile.Lottery", {
             "silk_id": self.silk_id, "prize_type": 1})
@@ -673,9 +678,15 @@ def run_account(u):
         else:
             u.GetDailyTask(t)
 
-    # 抽奖 ×6
-    for _ in range(6):
-        u.Lottery()
+    # 抽奖: 用幸运次数决定抽几次, 0 次不发请求(与 xc_mini 一致)
+    li = u.LotteryInfo()
+    lucky = int((li or {}).get("lucky_times") or 0)
+    if lucky:
+        log(f"[抽奖] 幸运次数 {lucky}, 开始抽奖")
+        for _ in range(min(lucky, 6)):
+            u.Lottery()
+    else:
+        log("[抽奖] 无抽奖次数, 跳过")
 
     # 额外抽奖 ×2
     for s in (1, 2):
