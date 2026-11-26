@@ -376,11 +376,12 @@ class XiaocanUser:
             "city_code": CITY_CODE, "silk_id": self.silk_id})
         return d.get("promotions") or []
 
-    def CreateUserPromotion(self, promotion_id):
+    def CreateUserPromotion(self, promotion_id, name=""):
         d = self.rpc("SilkwormChallenge", "ChallengeService.CreateUserPromotion", {
             "city_code": CITY_CODE, "promotion_id": promotion_id, "silk_id": self.silk_id})
         st = d.get("status", {})
-        log(f"[挑战赛] 报名 id={promotion_id}: {'OK' if st.get('code') == 0 else st.get('msg', st.get('code'))}")
+        label = name or f"id={promotion_id}"
+        log(f"[挑战赛] 报名「{label}」: {'OK' if st.get('code') == 0 else st.get('msg', st.get('code'))}")
 
     def GetAgencyInfo(self):
         d = self.rpc("Silkworm", "SilkwormService.GetAgencyInfo", {"silk_id": self.silk_id})
@@ -653,15 +654,13 @@ def run_account(u):
     u.OpenBox()
     u.YbFlashSale()
 
-    # 挑战赛报名
+    # 挑战赛: 先拉可报名列表, 只报列表里实际存在的, 不写死 id
     try:
         promos = u.ListNormalPromotionsByUser()
-        matched = [p for p in promos
-                   if re.search(r"5天新增2名有效团员|连续下单", p.get("description") or "")]
-        matched.append({"name": "下单挑战赛", "id": 791})
-        for p in matched:
-            log(f"[INFO] 获取「{p.get('name')}」挑战...")
-            u.CreateUserPromotion(p.get("id"))
+        if not promos:
+            log("[挑战赛] 当前无可报名的挑战")
+        for p in promos:
+            u.CreateUserPromotion(p.get("id"), p.get("name"))
     except Exception as e:
         log(f"[挑战赛] 异常: {e}")
 
