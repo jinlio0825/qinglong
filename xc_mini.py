@@ -1429,13 +1429,13 @@ def run_daily_account(u):
 
     # 转盘抽奖次数任务: 先查 LotteryInfo, 只做 lottery_info 里标记为未完成的任务。
     # type 与 is_xxx 字段的对应(抓包 + 实测确认):
-    #   type=8  is_view_bwc_page     浏览霸王餐页
-    #   type=9  is_view_welfare_page 浏览福利页
-    #   type=10 is_view_tp_ad        看第三方广告
-    #   type=11 is_view_douyin_mall  浏览抖音商城
-    #   type=2  if_shared            分享
-    #   type=1  签到(type 1 与签到任务重复, 通常已完成)
-    # type=4 沾一沾 / type=3,5,6 不存在, 不主动发。
+    #   type=8  浏览霸王餐页 (响应提示「浏览霸王餐页面限一次」→ 对应 is_view_bwc_page)
+    #   type=9  浏览福利页
+    #   type=10 看第三方广告
+    #   type=11 浏览抖音商城 (实测响应提示同为「浏览霸王餐页面限一次」,
+    #           疑似服务端文案未区分; 保留发送, 以实际加次数为准)
+    #   type=2  分享 (if_shared)
+    # type=3,5,6 不存在(请求参数错误), 不发。
     li = u.GetLotteryInfo()
     info = (li or {}).get("lottery_info") or {}
     TYPE_BY_FLAG = {
@@ -1447,19 +1447,23 @@ def run_daily_account(u):
     }
     todo = [(flag, t) for flag, t in TYPE_BY_FLAG.items() if not info.get(flag)]
     if todo:
-        log(f"[抽奖次数] 待完成 {len(todo)} 项: "
-            f"{[(f, t) for f, t in todo]}")
         for flag, t in todo:
-            u.AddLotteryTimes(t)
+            ok, _ = u.AddLotteryTimes(t)
     else:
         log("[抽奖次数] 所有任务今日已完成")
 
-    # 抽奖: 先看进度与额度, 有多少抽多少(上限 6 次)
+    # 抽奖: 用幸运次数(lucky_times)决定抽几次, 0 次就不发请求
     u.GetLotteryProgress()
-    for _ in range(6):
-        u.Lottery()
+    lucky = int((li.get("lottery_info") or {}).get("lucky_times") or 0)
+    lucky = min(lucky, 6)     # 上限 6, 防呆
+    if lucky:
+        log(f"[抽奖] 幸运次数 {lucky}, 开始抽奖")
+        for _ in range(lucky):
+            u.Lottery()
+    else:
+        log("[抽奖] 无抽奖次数, 跳过")
 
-    # 额外抽奖 ×2
+    # 额外抽奖 ×2(进度接口显示宝箱可领才有意义, 先领再抽)
     for s in (1, 2):
         u.ReceiveExtraLottery(s)
 
