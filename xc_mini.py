@@ -429,6 +429,51 @@ class XiaocanMiniUser:
             log(f"[成长值] 下一节点 {nxt.get('days')}天 → +{nxt.get('value')} 成长值")
         return days, signed
 
+    # ---------- 挑战赛 ----------
+    def ListNormalPromotionsByUser(self):
+        """拉可报名的挑战赛列表(与 APP 版同一接口, 小程序实测 200 可用)。"""
+        d = self.rpc("SilkwormChallenge", "ChallengeService.ListNormalPromotionsByUser", {
+            "city_code": int(self.city) if self.city.isdigit() else 330109,
+            "silk_id": self.silk_id})
+        return d.get("promotions") or []
+
+    def CreateUserPromotion(self, promotion_id, name=""):
+        d = self.rpc("SilkwormChallenge", "ChallengeService.CreateUserPromotion", {
+            "city_code": int(self.city) if self.city.isdigit() else 330109,
+            "promotion_id": promotion_id, "silk_id": self.silk_id})
+        st = d.get("status") or {}
+        label = name or f"id={promotion_id}"
+        log(f"[挑战赛] 报名「{label}」: {'OK' if st.get('code') == 0 else st.get('msg', st.get('code'))}")
+
+    def ListProcessingUserPromotion(self):
+        """查进行中的挑战(抓包实证: 返回 user_promotions, 含进度)。"""
+        d = self.rpc("SilkwormChallenge", "ChallengeService.ListProcessingUserPromotion", {
+            "silk_id": self.silk_id})
+        return d.get("user_promotions") or []
+
+    def ChallengeFlow(self):
+        """挑战赛: 报告进行中的 → 拉可报名列表 → 只报列表里实际存在的。"""
+        # 进行中的挑战(报进度, 不重复报名)
+        try:
+            processing = self.ListProcessingUserPromotion()
+            for up in processing:
+                p = up.get("promotion") or {}
+                ut = up.get("user_task") or {}
+                log(f"[挑战赛] 进行中: {p.get('name')} (已邀 {ut.get('current_number')}"
+                    f"/{(p.get('stage_tasks') or [{}])[0].get('expect_num', '?')} 人)")
+        except Exception as e:
+            log(f"[挑战赛] 查询进行中异常: {e}")
+        # 可报名列表
+        try:
+            promos = self.ListNormalPromotionsByUser()
+            if not promos:
+                log("[挑战赛] 当前无可报名的挑战")
+                return
+            for p in promos:
+                self.CreateUserPromotion(p.get("id"), p.get("name"))
+        except Exception as e:
+            log(f"[挑战赛] 异常: {e}")
+
     def BindInviter(self):
         self.rpc("InviteWord", "InviteWordService.BindInviter", {
             "inviter_silk_id": RECOMMEND_ID,
@@ -1348,6 +1393,9 @@ def run_daily_account(u):
     u.SignInInfo()
     u.OpenBox()
     u.TakeGift()
+
+    # 挑战赛: 报告进行中的进度, 可报名列表里有才报名
+    u.ChallengeFlow()
 
     # 元宝: 领取待入账 + 列表/闪购
     u.YbFlashSale()
