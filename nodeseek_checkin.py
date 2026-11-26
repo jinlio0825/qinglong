@@ -4,10 +4,32 @@
 name: NodeSeek 每日签到
 定时规则
 cron: 23 8 * * *
+==================================
+NodeSeek 每日签到(纯 HTTP, 无浏览器)
+==================================
+原理:
+  签到接口 POST /api/attendance?random=false, 靠登录态 Cookie 识别用户。
+  实测(2026-11-26): 不带 cookie 返回 {"message":"USER NOT FOUND"},
+  说明接口本身没有签名/风控头强校验(浏览器里的 preLogin 头只是
+  附加风控数据, 缺失时服务端仅按未登录处理), curl_cffi 模拟浏览器
+  TLS 指纹即可直连, 不需要 patchright/浏览器内核。
+
+Cookie 获取(一次性, 手动):
+  1. 浏览器登录 https://www.nodeseek.com
+  2. F12 → Application → Cookies → 复制整段 Cookie 请求头
+     (关键是 mmscriptor/Bearer 一类的会话 cookie, 整段复制最稳)
+  3. 青龙环境变量 NODESEEK_COOKIE 填入, 多账号用 & 分隔
+     (多账号时建议每段用不同浏览器的完整 cookie)
+
+有效期: NodeSeek 会话 cookie 长期有效, 被登出/改密才需要重新抓。
+依赖: pip3 install curl_cffi  (青龙 Python3 依赖里加)
+
+环境变量:
+  NODESEEK_COOKIE   必填, 完整 Cookie 请求头, 多账号 & 分隔
+  NODESEEK_UA       可选, 与抓 cookie 时浏览器一致的 UA(默认 Chrome 134)
 """
 
-import os, sys, time, json, hashlib
-from patchright.sync_api import sync_playwright
+import os, sys, time
 
 # ---------------- 统一通知模块加载 ----------------
 hadsend = False
@@ -19,13 +41,18 @@ try:
 except ImportError:
     print("⚠️  未加载通知模块，跳过通知功能")
 
-# ---------------- 环境变量 ----------------
-# NodeSeek 账号：账号#密码 连接，多账号用 & 连接
-# 示例：awemagisi@gmail.com#zxc.123456&test@qq.com#abc123456
-ENV_ACCOUNT = "NODESEEK_ACCOUNT"
+try:
+    from curl_cffi import requests as http
+    HAS_CURL = True
+except ImportError:
+    HAS_CURL = False
+    print("❌ 未安装 curl_cffi: 青龙依赖管理(Python3)里添加 curl_cffi")
 
+ENV_COOKIE = "NODESEEK_COOKIE"
 BASE = "https://www.nodeseek.com"
-PROFILE_ROOT = os.path.join(os.path.expanduser("~"), ".nodeseek_profile")
+UA = os.getenv("NODESEEK_UA",
+               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
 
 
 def log(msg):
@@ -33,180 +60,75 @@ def log(msg):
 
 
 def load_accounts():
-    """解析环境变量：账号#密码，多账号 & 连接"""
-    raw = (os.getenv(ENV_ACCOUNT) or "").strip()
+    """解析环境变量: 整段 Cookie, 多账号 & 分隔"""
+    raw = (os.getenv(ENV_COOKIE) or "").strip()
     if not raw:
-        print(f"❌ 未设置环境变量 {ENV_ACCOUNT}")
-        print(f"   格式：账号#密码，多账号用 & 连接")
-        print(f"   示例：export {ENV_ACCOUNT}=\"user@qq.com#pass1&user2@gmail.com#pass2\"")
+        print(f"❌ 未设置环境变量 {ENV_COOKIE}")
+        print("   格式: 浏览器 F12 复制的完整 Cookie 请求头, 多账号 & 分隔")
         return []
     accounts = []
     for i, item in enumerate(raw.split("&"), 1):
-        item = item.strip()
-        if not item:
-            continue
-        if "#" not in item:
-            print(f"⚠️  第 {i} 个账号格式错误（缺少 # 分隔）：{item[:6]}***")
-            continue
-        email, password = item.split("#", 1)
-        email, password = email.strip(), password.strip()
-        if email and password:
-            accounts.append((email, password))
-        else:
-            print(f"⚠️  第 {i} 个账号账号或密码为空，已跳过")
+        c = item.strip()
+        if c:
+            accounts.append((i, c))
     print(f"📋 共加载 {len(accounts)} 个账号")
     return accounts
 
 
-def profile_dir(email):
-    """每个账号独立的登录态目录（用邮箱 md5 命名，避免特殊字符问题）"""
-    return os.path.join(PROFILE_ROOT, hashlib.md5(email.encode()).hexdigest()[:16])
-
-
-def pass_cf(page, timeout_ms=180000):
-    """等 Cloudflare 挑战放行（标志：页面标题含 NodeSeek）。"""
-    page.wait_for_function("() => document.title.includes('NodeSeek')", timeout=timeout_ms)
-    page.wait_for_timeout(3000)
-
-
-def api_post(page, path, body=None, query=""):
-    """页面上下文内调用站点 API，自动带上 preLogin 风控头。"""
-    return page.evaluate("""async ([path, query, body]) => {
-        const mod = await import('/assets/preLogin-fiEAKL_6.js');
-        const h = mod.g ? await mod.g() : {};
-        const resp = await fetch(path + query, {
-            method: 'POST', credentials: 'include',
-            headers: {'Content-Type': 'application/json',
-                      'X-Requested-With': 'XMLHttpRequest', ...h},
-            body: body ? JSON.stringify(body) : undefined
-        });
-        return {status: resp.status, body: await resp.json().catch(() => null)};
-    }""", [path, query, body])
-
-
-def try_checkin(page):
-    page.goto(f"{BASE}/board", timeout=60000)
-    pass_cf(page)
-    r = api_post(page, "/api/attendance", query="?random=false")
-    b = r.get("body") or {}
+def checkin(cookie, idx):
+    """签到一次。返回 (是否成功, 消息)。"""
+    headers = {
+        "user-agent": UA,
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "origin": BASE,
+        "referer": f"{BASE}/board",
+        "cookie": cookie,
+    }
+    r = http.post(f"{BASE}/api/attendance?random=false",
+                  headers=headers, impersonate="chrome", timeout=20, json={})
+    if r.text:
+        try:
+            b = r.json()
+        except Exception:
+            b = {}
+    else:
+        b = {}
     msg = str(b.get("message") or b)
     if b.get("success") is True:
-        return "ok", f"签到成功：{msg}（获得 {b.get('gain','?')} 鸡腿，余额 {b.get('current','?')}）"
+        return True, f"签到成功: {msg} (获得 {b.get('gain','?')} 鸡腿, 余额 {b.get('current','?')})"
     if "已签到" in msg or "already" in msg.lower() or "重复" in msg:
-        return "ok", f"今日已签到过：{msg}"
-    if "USER NOT FOUND" in msg or r["status"] in (401, 404):
-        return "not_logged_in", msg
-    return "fail", f"HTTP {r['status']}: {msg}"
-
-
-def do_login(page, email, password):
-    """账号密码登录；若站点要求邮箱动态验证则直接调用 emailSignIn 提交。"""
-    log("未登录，开始自动登录 ...")
-    page.goto(f"{BASE}/signIn.html", timeout=60000)
-    pass_cf(page)
-    r = api_post(page, "/api/account/signIn",
-                 body={"username": email, "password": password})
-    log(f"signIn: {r['status']} {json.dumps(r.get('body'), ensure_ascii=False)[:150]}")
-    if (r.get("body") or {}).get("success") is not True:
-        # 若被要求邮箱动态验证，取一个新验证码并提交
-        log("需要邮箱动态验证，自动发码 ...")
-        import urllib.parse
-        page.goto(f"{BASE}/emailSignIn.html?email={urllib.parse.quote(email)}", timeout=60000)
-        pass_cf(page)
-        page.wait_for_function(
-            "() => Array.from(document.querySelectorAll('[name=cf-turnstile-response]')).some(e => e.value)",
-            timeout=90000)
-        r2 = page.evaluate("""async ([email]) => {
-            const mod = await import('/assets/preLogin-fiEAKL_6.js');
-            const h = mod.g ? await mod.g() : {};
-            const token = Array.from(document.querySelectorAll('[name=cf-turnstile-response]'))
-                .find(e => e.value)?.value;
-            const resp = await fetch('/api/email', {
-                method: 'POST', credentials: 'include',
-                headers: {'Content-Type': 'application/json', ...h},
-                body: JSON.stringify({email, mode: 'totp',
-                                      token, source: 'turnstile', version: 'v3'})
-            });
-            return {status: resp.status, body: await resp.json().catch(() => null)};
-        }""", [email])
-        log(f"发码: {r2['status']} {json.dumps(r2.get('body'), ensure_ascii=False)}")
-        if (r2.get("body") or {}).get("success") is not True:
-            return False, f"发码失败: {r2.get('body')}"
-        # 验证码通过邮件发送，自动模式下无法读取邮箱内容
-        return False, "需要邮箱验证码（登录态已失效且需重新验证设备）"
-    return True, "登录成功"
-
-
-def launch_ctx(p, email):
-    """按账号启动持久化浏览器上下文。
-
-    headless 自动判断：有环境变量 NODESEEK_HEADLESS 用它；
-    否则有显示器（桌面）时有头（过盾更稳），无显示器（服务器）时无头。
-    chrome 渠道不存在时自动回退内置 chromium。
-    """
-    headless_env = os.getenv("NODESEEK_HEADLESS", "").strip().lower()
-    if headless_env in ("true", "false"):
-        headless = headless_env == "true"
-    else:
-        headless = not os.environ.get("DISPLAY")
-    channel = os.getenv("NODESEEK_CHANNEL", "chrome").strip() or None
-    args = ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
-    if not headless:
-        args.append("--window-position=-32000,-32000")
-    kwargs = dict(user_data_dir=profile_dir(email), headless=headless,
-                  args=args, no_viewport=True)
-    if channel:
-        try:
-            return p.chromium.launch_persistent_context(channel=channel, **kwargs)
-        except Exception as e:
-            log(f"⚠️  chrome 渠道启动失败（{str(e)[:80]}），回退内置 chromium")
-    return p.chromium.launch_persistent_context(**kwargs)
-
-
-def run_account(email, password, idx, total):
-    """跑单个账号，返回 (是否成功, 结果消息)"""
-    masked = email[:3] + "***" + email[email.find("@"):] if "@" in email else email[:3] + "***"
-    print(f"\n{'='*50}")
-    print(f"🟢 开始账号 [{idx}/{total}]：{masked}")
-    print(f"{'='*50}")
-    try:
-        with sync_playwright() as p:
-            ctx = launch_ctx(p, email)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            try:
-                result, msg = try_checkin(page)
-                if result == "not_logged_in":
-                    ok, login_msg = do_login(page, email, password)
-                    if not ok:
-                        log(f"❌ 登录失败: {login_msg}")
-                        return False, f"登录失败: {login_msg}"
-                    result, msg = try_checkin(page)
-                icon = "✅" if result == "ok" else "❌"
-                log(f"{icon} {masked} {msg}")
-                return result == "ok", msg
-            finally:
-                ctx.close()
-    except Exception as e:
-        log(f"❌ 账号异常: {str(e)[:150]}")
-        return False, f"异常: {str(e)[:100]}"
+        return True, f"今日已签到过: {msg}"
+    if "USER NOT FOUND" in msg or b.get("status") == 404:
+        return False, "cookie 失效(USER NOT FOUND), 请重新抓取"
+    return False, f"HTTP {r.status_code}: {msg[:120]}"
 
 
 def main():
+    if not HAS_CURL:
+        sys.exit(1)
     accounts = load_accounts()
     if not accounts:
         sys.exit(1)
 
     results = []
-    for idx, (email, password) in enumerate(accounts, 1):
-        ok, msg = run_account(email, password, idx, len(accounts))
-        masked = email[:3] + "***" + email[email.find("@"):] if "@" in email else email[:3] + "***"
+    for idx, cookie in accounts:
+        masked = f"账号{idx}(cookie...{cookie[-8:]})"
+        print(f"\n{'='*50}")
+        print(f"🟢 开始 {masked}")
+        try:
+            ok, msg = checkin(cookie, idx)
+        except Exception as e:
+            ok, msg = False, f"异常: {str(e)[:120]}"
+        icon = "✅" if ok else "❌"
+        log(f"{icon} {masked} {msg}")
         results.append((masked, ok, msg))
         if idx < len(accounts):
-            time.sleep(5)  # 多账号间隔，降低风控风险
+            time.sleep(5)  # 多账号间隔
 
     # ---------------- 汇总通知 ----------------
     ok_count = sum(1 for _, ok, _ in results if ok)
-    lines = [f"NodeSeek 签到完成：{ok_count}/{len(results)}", ""]
+    lines = [f"NodeSeek 签到完成: {ok_count}/{len(results)}", ""]
     for masked, ok, msg in results:
         icon = "✅" if ok else "❌"
         lines.append(f"{icon} {masked}")
