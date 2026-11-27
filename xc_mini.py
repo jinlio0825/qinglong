@@ -932,9 +932,11 @@ class XiaocanMiniUser:
         if not info:
             log("[大牌] 券池查询失败, 跳过")
             return False
-        # today_grabbed / user_day_num 只反映限量券, 才是判断依据
-        if info.get("today_grabbed") or int(info.get("user_day_num") or 0) >= 1:
-            log(f"[大牌] 今日限量券已抢过 (user_day_num={info.get('user_day_num')}), 跳过")
+        # today_grabbed 是"今天是否已抢"的权威字段(实证: user_day_num 是跨日残留
+        # 计数, 昨天抢过今天仍为 1, 不能作为判断依据 —— 11-27 实测 9:27 误判跳过,
+        # 9:30 空窗, 券被抢完)
+        if info.get("today_grabbed"):
+            log("[大牌] 今日限量券已抢过 (today_grabbed=true), 跳过")
             return False
         if not self.HasExtraBrandCardPool():
             log("[大牌] 无额外大牌券池, 跳过")
