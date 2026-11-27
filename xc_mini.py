@@ -920,66 +920,47 @@ class XiaocanMiniUser:
           BrandCardInfo      type=1  svip 会员自领券, 不用抢, 与本流程无关
           ExtraBrandCardPool type=99 9:30 限量抢兑券, 这才是要抢的
         因此只以 ExtraBrandCardPool 的数据为准, 不再用 BrandCardInfo 判断。
+
+        策略(用户明确要求): 到点直接打, 不看前置状态 ——
+        不判断已持有/今日已抢/有无库存, 任何前置跳过都可能误判翻车
+        (11-27 9:27 user_day_num 残留误判即为例子)。成败只看结果: 发完
+        后卡包数量是否增加。前置数据只打日志做记录。
         """
-        # 1. 只查卡包做记录, 不作为"是否该抢"的依据 ——
-        #    卡包里的 svip 保底券(type=1 自领)与 9:30 限量券(type=99)是两回事,
-        #    持有保底券不代表今天限量券已抢。
+        # 1. 抢前记录(仅日志与数量基准, 不做任何跳过判断)
         self.GetOwnedBrandCards()
         before_cnt = self.CountOwnedBrandCards()
-
-        # 2. 查 9:30 限量大牌券池, 只以它的数据判断
         info = self.GetExtraBrandCardPool()
-        if not info:
-            log("[大牌] 券池查询失败, 跳过")
-            return False
-        # today_grabbed 是"今天是否已抢"的权威字段(实证: user_day_num 是跨日残留
-        # 计数, 昨天抢过今天仍为 1, 不能作为判断依据 —— 11-27 实测 9:27 误判跳过,
-        # 9:30 空窗, 券被抢完)
-        if info.get("today_grabbed"):
-            log("[大牌] 今日限量券已抢过 (today_grabbed=true), 跳过")
-            return False
-        if not self.HasExtraBrandCardPool():
-            log("[大牌] 无额外大牌券池, 跳过")
+        if info:
+            pools_all = info.get("pools") or []
+            for p in pools_all:
+                log(f"[大牌] 池: type={p.get('type')} {p.get('name')} "
+                    f"库存={'有' if p.get('has_inventory') else '无'} "
+                    f"今日已抢标记={info.get('today_grabbed')} "
+                    f"(day={info.get('user_day_num')} month={info.get('user_month_num')})")
+
+        # 2. 找 type=99 的场次拿 start_time(只用于对时, 不因状态跳过)
+        pools = (info or {}).get("pools") or []
+        target = next((p for p in pools if int(p.get("type") or 0) == 99), None)
+        if not target:
+            # 池里没有 99 也要打 —— 直接裸打 GrabBrandCard(type=99), 立即执行
+            log("[大牌] 券池无 type=99 场次, 直接裸打 GrabBrandCard(type=99)")
+            self.GrabBrandCardAsync({"type": 99, "name": "通用大牌券", "start_time": 0})
+            after_cnt = self.CountOwnedBrandCards()
+            if after_cnt > before_cnt:
+                log(f"🎉 [大牌] 核验通过: 卡包新增 {after_cnt - before_cnt} 张大牌券")
+                return True
+            log(f"💔 [大牌] 卡包数量未变化({before_cnt} → {after_cnt}), 本次未抢到")
             return False
 
-        pools = info.get("pools") or []
-        cands = []
-        for p in pools:
-            if p.get("is_grabbed"):
-                continue
-            if p.get("is_reach_month_upper_limit"):
-                continue
-            if not p.get("has_inventory"):
-                # 无库存时仍可能未到开抢时间, 保留以便按 start_time 等待
-                if not p.get("start_time"):
-                    continue
-            cands.append(p)
-        if not cands:
-            log("[大牌] 无可抢券池(已抢/达上限/类型不符/门槛超标)")
-            self.GetUserTencentVipInfo()
-            return False
-
-        # 3. 挑最近的一场并等待(照联通写法: 循环微调, 最后 0.3 秒内精确定位)
+        # 3. 按 start_time 等待(纯对时用, 不做任何状态跳过; 超窗就立即打)
         now = time.time()
-        cands.sort(key=lambda x: x.get("start_time") or 0)
         wait_max = BRAND_WAIT_MAX_MS / 1000.0
         before = BRAND_BEFORE_MS / 1000.0
-        interval = BRAND_INTERVAL_MS / 1000.0
-        target = None
-        for p in cands:
-            st = p.get("start_time") or 0
-            delay = (st - now - before) if st else 0
-            if delay > wait_max:
-                log(f"[大牌] type={p.get('type')} {p.get('name')} 距开抢 {int(delay)}s, "
-                    f"超过最大等待 {int(wait_max)}s, 跳过")
-                continue
-            target = p
-            break
-        if not target:
-            log("[大牌] 没有处于可等待窗口内的券")
-            return False
         st_t = target.get("start_time") or 0
-        if st_t and st_t > now:
+        delay = (st_t - now - before) if st_t else 0
+        if delay > wait_max:
+            log(f"[大牌] 距开抢 {int(delay)}s 超过最大等待 {int(wait_max)}s, 不等待直接开打")
+        elif st_t and st_t > now:
             wait_seconds = st_t - time.time() - before
             log(f"[大牌] 目标: {target.get('name')} (type={target.get('type')}) "
                 f"正在等待开抢... (剩余 {wait_seconds:.1f} 秒)")
