@@ -131,21 +131,17 @@ PROXY = ""                            # 需要代理时改这里
 REQUEST_INTERVAL = 3.0                # 请求间隔秒
 IS_WALLET = False                     # 自动提现, 需要时改 True
 
-# ---------- 抢大牌(照联通 grab_mode 写法) ----------
+# ---------- 抢大牌(JS 原版 BrandCardAuto 移植, 11-28 修正) ----------
 # XC_BRAND_ENABLE 默认开启: true=抢大牌+元宝闪购, false=只跑日常
+# 关键修正(11-28 实证): 抢券接口是 GrabExtraBrandCard(不是 GrabBrandCard, 打它会 500),
+# 且必须走 BrandCardRpc 独立通道(APP 特征头 + hzaiguojiang origin + 显式 SilkwormVip)
 BRAND_ENABLE = os.getenv("XC_BRAND_ENABLE", "true").lower() != "false"
-BRAND_BEFORE_MS = 200                 # 开抢前提毫秒
-BRAND_INTERVAL_MS = 150               # 冲击间隔毫秒(每次提交后等 150ms 再发)
-BRAND_ATTEMPTS = 10                   # 最多冲击次数
-BRAND_WAIT_MAX_MS = 600000            # 距开抢超此毫秒则跳过(10分钟)
-# 9:30 限量抢兑的大牌券动作接口 —— 已实测确认:
-#   VipRightsService.GrabBrandCard  body={"silk_id":..., "type": 池的type}
-#   - type=1 (svip 自领券, BrandCardInfo 的池) → code=0, 返回券信息(实测领到)
-#   - type=99 (9:30 限量池, ExtraBrandCardPool 的池) → code=10001"请求参数错误"
-#     (原因待验证: 可能是已抢完/时段外/今日已抢, 明早 9:30 实测即知)
-#   - 不带 type → "invalid field Type: value '0' must be greater than '0'"
-# 券是否真到手, 一律以 GetOwnedBrandCards 卡包核验为准。
-BRAND_GRAB_METHOD = "VipRightsService.GrabBrandCard"   # 抢券接口(已实测确认)
+BRAND_TYPE = 99                        # 9:30 限量券
+BRAND_BEFORE_MS = int(os.getenv("XC_BRAND_BEFORE_MS", "300"))
+BRAND_INTERVAL_MS = int(os.getenv("XC_BRAND_INTERVAL_MS", "100"))
+BRAND_ATTEMPTS = int(os.getenv("XC_BRAND_ATTEMPTS", "5"))
+BRAND_WAIT_MAX_MS = int(os.getenv("XC_BRAND_WAIT_MAX_MS", "180000"))
+BRAND_GRAB_METHOD = "VipRightsService.GrabExtraBrandCard"
 
 # 元宝闪购要抢的商品 exchange_id, 默认 200 = svip⚡️1元红包(4000元宝)
 # 可用 XC_YB_GOODS_ID 环境变量覆盖; 也可写多个: "200,199"
@@ -155,6 +151,7 @@ YB_GOODS_ID = os.getenv("XC_YB_GOODS_ID", "200").strip()
 # false=只发抓包验证过的 2/8/9/10/11
 
 RECOMMEND_ID = 12159598643            # 推荐人
+PHONE_MIDDLE_GLOBAL = os.getenv("XC_PHONE_MIDDLE", "")   # 手机中间4位全局兜底(账号字段优先)
 
 DD_BOT_TOKEN = ""                     # 钉钉 token, 留空不推送
 DD_BOT_SECRET = ""
@@ -268,6 +265,8 @@ class XiaocanMiniUser:
         self.token = acc.get("token") or acc.get("x-sivir") or ""
         self.userName = acc.get("userName") or self.userId
         self.city = str(acc.get("city") or DEFAULT_CITY)
+        self.interval = REQUEST_INTERVAL    # 每账号独立间隔(抢兑时改这里, 不动全局)
+        self.phone_middle = str(acc.get("phone_middle") or PHONE_MIDDLE_GLOBAL or "").strip()
         self.session_id = acc.get("sessionId") or str(uuid.uuid4())
         self.ck_status = True
         self.red_pack_rain_done = False
@@ -351,7 +350,7 @@ class XiaocanMiniUser:
             return {}
         finally:
             if not no_delay:
-                time.sleep(REQUEST_INTERVAL)
+                time.sleep(self.interval)
 
     # ---------- 账号与资产 ----------
     def GetUserInfo(self):
@@ -367,7 +366,8 @@ class XiaocanMiniUser:
 
     def GetUserTaskV2(self):
         return (self.rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2",
-                         {"silk_id": self.silk_id}).get("data") or {})
+                         {"silk_id": self.silk_id,
+                          "user_id": int(self.userId) if self.userId.isdigit() else 0}).get("data") or {})
 
     def GetPoint(self):
         return self.GetUserTaskV2().get("point") or 0
@@ -404,11 +404,12 @@ class XiaocanMiniUser:
     def SignInLottery(self):
         """每日签到(小程序抓包: VipRightsService.SignInLottery, 与 APP 版同接口)。"""
         d = self.rpc("SilkwormVip", "VipRightsService.SignInLottery", {"silk_id": self.silk_id})
-        data = d.get("data") or {}
-        if data:
-            score = (data.get("score") or 0) / 100
-            prices = data.get("price") or []
-            log(f"[签到] 成功! 奖 {score} 充值金" + (f" {prices[0]}元券" if prices else ""))
+        # score/price 在响应顶层(实测: data 层不存在, 旧代码读 data.score 恒为 0)
+        if (d.get("status") or {}).get("code") == 0:
+            score = (d.get("score") or 0) / 100
+            prices = d.get("price") or []
+            p0 = (prices[0] or {}).get("name") if prices and isinstance(prices[0], dict) else (prices[0] if prices else "")
+            log(f"[签到] 成功! 奖 {score} 成长值" + (f" {p0}" if p0 else ""))
         else:
             st = d.get("status") or {}
             log(f"[签到] {st.get('msg', st.get('code'))}")
@@ -440,7 +441,8 @@ class XiaocanMiniUser:
     def CreateUserPromotion(self, promotion_id, name=""):
         d = self.rpc("SilkwormChallenge", "ChallengeService.CreateUserPromotion", {
             "city_code": int(self.city) if self.city.isdigit() else 330109,
-            "promotion_id": promotion_id, "silk_id": self.silk_id})
+            "promotion_id": promotion_id, "silk_id": self.silk_id,
+            "if_use_ali_go": False})   # JS 原版带此字段, 对齐
         st = d.get("status") or {}
         label = name or f"id={promotion_id}"
         log(f"[挑战赛] 报名「{label}」: {'OK' if st.get('code') == 0 else st.get('msg', st.get('code'))}")
@@ -479,6 +481,20 @@ class XiaocanMiniUser:
             "inviter_silk_id": RECOMMEND_ID,
             "user_silk_id": self.silk_id,
         })
+
+    def RiskPhoneCheck(self):
+        """手机号中间四位风控校验(JS 原版 RiskPhoneCheck 移植)。
+
+        签到/开宝箱前调用。phone_middle 缺省时跳过(JS 同行为)。
+        """
+        if not self.phone_middle:
+            return
+        if getattr(self, "_risk_checked", False):
+            return
+        d = self.rpc("Brs", "RiskCheckService.PhoneCheck", {
+            "silk_id": self.silk_id, "number": self.phone_middle})
+        self._risk_checked = bool(d and d.get("pass"))
+        log(f"[风控] 手机中间四位校验: {'pass' if self._risk_checked else json.dumps(d.get('status') or d, ensure_ascii=False)[:80]}")
 
     # ---------- 日常任务(积分/元宝) ----------
     def GetDailyTaskList(self):
@@ -744,7 +760,7 @@ class XiaocanMiniUser:
     def GetOwnedBrandCards(self):
         """查已持有的大牌券(card_types=[13,3], 抓包实证 card_type=13 即通用大牌券)。"""
         d = self.rpc("SilkwormCard", "SilkwormCardService.GetUserCardList", {
-            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 999,
+            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 1000,
             "card_types": [13, 3], "card_ids": None})
         lst = d.get("list") or []
         cards = []
@@ -762,7 +778,7 @@ class XiaocanMiniUser:
     def CountOwnedBrandCards(self):
         """卡包内大牌券数量(静默, 不打日志), 用于抢券前后对比核验。"""
         d = self.rpc("SilkwormCard", "SilkwormCardService.GetUserCardList", {
-            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 999,
+            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 1000,
             "card_types": [13, 3], "card_ids": None})
         return sum(1 for it in (d.get("list") or [])
                    if "大牌" in ((it.get("card") or {}).get("name") or ""))
@@ -778,213 +794,136 @@ class XiaocanMiniUser:
                 f"抢过={info.get('grab_time')} 有库存={info.get('has_inventory')} 下次 {nts}")
         return info
 
-    def GrabBrandCard(self, pool=None):
-        """抢大牌券 —— 接口已实测确认。
+    def BrandCardRpc(self, method, body, no_delay=False):
+        """大牌券专用通道(JS BrandCardRpc 移植): APP 特征 + hzaiguojiang origin + 显式 SilkwormVip。
 
-        VipRightsService.GrabBrandCard, body={"silk_id":..., "type": 池的type}
-          - type=1  svip 自领券(不用抢, 但同接口可领)
-          - type=99 9:30 限量抢兑券(目标)
-        成败以 GetOwnedBrandCards 卡包核验为准(接口可能只回空壳)。
+        11-28 实证: 抢券走普通小程序 rpc 通道会 HTTP 500 —— JS 原版用的是
+        独立通道(x-platform: Android + origin/referer: gw.hzaiguojiang.com)。
         """
-        global BRAND_GRAB_METHOD
-        body = self._brand_grab_body(pool)
-        srv = BRAND_GRAB_METHOD.split(".", 1)[0]
-        d = self.rpc(srv, BRAND_GRAB_METHOD, body, no_delay=True)
-        if not d:
-            log("[大牌] 抢券接口无响应")
-            return False
-        st = d.get("status") or {}
-        code = st.get("code")
-        if code == 0:
-            info = d.get("info") or {}
-            exp = info.get("expired_at")
-            log(f"[大牌] 抢券受理成功 (过期时间: {exp})")
-            return True
-        log(f"[大牌] 抢券返回: {st.get('msg') or code}")
-        return False
-
-    def _fire_grab(self, mth, body, results, lock):
-        """发一次抢券请求并把结果塞进共享列表(供异步打击线程池调用)。"""
-        srv = mth.split(".", 1)[0] if "." in mth else "SilkwormVip"
+        headers = {**self.headers,
+                   "origin": "https://gw.hzaiguojiang.com",
+                   "referer": "https://gw.hzaiguojiang.com/",
+                   "content-type": "application/json",
+                   "servername": "SilkwormVip",
+                   "methodname": method,
+                   **self._sign_headers(self.teemo, "SilkwormVip", method)}
         try:
-            d = self.rpc(srv, mth, body, no_delay=True)
+            code, data = self._post(headers, body)
+            if code != 200:
+                log(f"[ERROR] {method}: HTTP {code}")
+                return {}
+            return data
         except Exception as e:
-            with lock:
-                results.append({"ok": False, "err": str(e)})
-            return
+            log(f"[ERROR] {method}: {e}")
+            return {}
+        finally:
+            if not no_delay:
+                time.sleep(self.interval)
+
+    def HasExtraBrandCardPool(self):
+        return self.BrandCardRpc("VipRightsService.HasExtraBrandCardPool", {"silk_id": self.silk_id})
+
+    def ExtraBrandCardPoolRpc(self):
+        return self.BrandCardRpc("VipRightsService.ExtraBrandCardPool", {"silk_id": self.silk_id})
+
+    def GetServerTimeOffset(self):
+        """服务器时钟偏差 ms(JS GetServerTimeOffset): 响应 Date 头校准开抢等待。"""
+        try:
+            t0 = time.time()
+            r = self.HasExtraBrandCardPool()
+            t1 = time.time()
+            date_str = ""
+            if r is not None and hasattr(r, "headers"):
+                date_str = r.headers.get("Date") or r.headers.get("date") or ""
+            if not date_str:
+                self.server_offset_ms = 0
+                return 0
+            from email.utils import parsedate_to_datetime
+            server_ms = parsedate_to_datetime(date_str).timestamp() + (t1 - t0) / 2
+            self.server_offset_ms = int((server_ms - t1) * 1000)
+            log(f"[大牌] 服务器时钟偏差 {self.server_offset_ms}ms")
+            return self.server_offset_ms
+        except Exception:
+            self.server_offset_ms = 0
+            return 0
+
+    def GrabExtraBrandCard(self, btype):
+        """抢券(JS GrabExtraBrandCard): body={"silk_id", "type"}。"""
+        d = self.BrandCardRpc(BRAND_GRAB_METHOD, {"silk_id": self.silk_id, "type": int(btype)},
+                              no_delay=True)
+        card_id = ((d or {}).get("info") or {}).get("card_id")
         st = (d or {}).get("status") or {}
-        code = st.get("code")
-        with lock:
-            results.append({
-                "ok": code == 0,
-                "code": code,
-                "msg": st.get("msg"),
-                "raw": d,
-            })
+        log(f"[大牌] 抢券 type={btype} 返回: {json.dumps(st, ensure_ascii=False)[:120]}"
+            + (f" card_id={card_id}" if card_id else ""))
+        return d
 
-    def GrabBrandCardAsync(self, pool=None):
-        """异步打击: 到点后按固定节奏持续发包, 不等响应, 边回收结果。
+    def BrandCardAuto(self):
+        """大牌券抢兑主流程(JS BrandCardAuto 逐行对照移植)。
 
-        1. 启动线程池(16 worker)
-        2. 每 BRAND_INTERVAL_MS(150ms) 投递一发, 立即继续投下一发
-        3. 主线程同时收割结果, 一旦发现 code==0 立刻置停止标志
-        4. 最多打 BRAND_ATTEMPTS 发
-        接口名已实测锁定, 无需探测。
-        """
-        from concurrent.futures import ThreadPoolExecutor
-        import threading
-
-        body = self._brand_grab_body(pool)
-        mth = BRAND_GRAB_METHOD
-        results = []
-        lock = threading.Lock()
-        stop = threading.Event()
-        sent = {"n": 0}
-
-        def success_found():
-            with lock:
-                for r in results:
-                    if r.get("ok"):
-                        return r
-            return None
-
-        log(f"[大牌] 🚀 异步打击启动: 每 {BRAND_INTERVAL_MS:.0f}ms 一发, "
-            f"最多 {BRAND_ATTEMPTS} 发, 不等响应")
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            for i in range(1, BRAND_ATTEMPTS + 1):
-                if stop.is_set():
-                    break
-                ex.submit(self._fire_grab, mth, body, results, lock)
-                sent["n"] = i
-                # 回收已完成的结果(非阻塞)
-                hit = success_found()
-                if hit:
-                    stop.set()
-                    log(f"🎉 [大牌] 抢兑成功! {json.dumps(hit.get('raw'), ensure_ascii=False)[:200]}")
-                    break
-                if i < BRAND_ATTEMPTS:
-                    # 只等固定节奏, 不等响应返回
-                    stop.wait(BRAND_INTERVAL_MS / 1000.0)
-            # 停止后再给在途请求一点时间回收结果
-            if not stop.is_set():
-                deadline = time.time() + 3.0
-                while time.time() < deadline:
-                    hit = success_found()
-                    if hit:
-                        log(f"🎉 [大牌] 抢兑成功!(延迟回收) "
-                            f"{json.dumps(hit.get('raw'), ensure_ascii=False)[:200]}")
-                        return True
-                    with lock:
-                        if len(results) >= sent["n"]:
-                            break
-                    time.sleep(0.05)
-
-        if success_found():
-            return True
-        with lock:
-            codes = {}
-            for r in results:
-                k = r.get("code") if r.get("code") is not None else "ERR"
-                codes[k] = codes.get(k, 0) + 1
-        log(f"💔 [大牌] {sent['n']} 发全部未成功 | 结果分布: {codes}")
-        return False
-
-    def _brand_grab_body(self, pool=None):
-        body = {"silk_id": self.silk_id}
-        if pool and pool.get("type") is not None:
-            body["type"] = pool.get("type")
-        return body
-
-    def BrandCardGrabFlow(self):
-        """抢大牌主流程: 查已持有 → 查可抢池 → 等开抢 → 冲击 → 核验。
-
-        整个流程把请求间隔临时压到 0，抢完恢复 —— 开抢窗口只有几秒，
-        3 秒/请求的间隔会让查询+冲击完全来不及。
+        判断逻辑照 JS 原版(字段是正确的, 与之前误判的 user_day_num 无关):
+          has===false 跳过 / today_grabbed || is_grabbed 跳过 /
+          无库存且已到开抢时间跳过 / 超等待上限放弃本次(绝不提前提交)
         """
         if not BRAND_ENABLE:
             log("[大牌] 未开启(XC_BRAND_ENABLE=false), 跳过")
             return False
-
-        global REQUEST_INTERVAL
-        saved_interval = REQUEST_INTERVAL
-        REQUEST_INTERVAL = 0
-        try:
-            return self._brand_flow_inner()
-        finally:
-            REQUEST_INTERVAL = saved_interval
-
-    def _brand_flow_inner(self):
-        """抢 9:30 限量大牌券(type=99)的实际流程。
-
-        注意区分两种大牌券:
-          BrandCardInfo      type=1  svip 会员自领券, 不用抢, 与本流程无关
-          ExtraBrandCardPool type=99 9:30 限量抢兑券, 这才是要抢的
-        因此只以 ExtraBrandCardPool 的数据为准, 不再用 BrandCardInfo 判断。
-
-        策略(用户明确要求): 到点直接打, 不看前置状态 ——
-        不判断已持有/今日已抢/有无库存, 任何前置跳过都可能误判翻车
-        (11-27 9:27 user_day_num 残留误判即为例子)。成败只看结果: 发完
-        后卡包数量是否增加。前置数据只打日志做记录。
-        """
-        # 1. 抢前记录(仅日志与数量基准, 不做任何跳过判断)
-        self.GetOwnedBrandCards()
-        before_cnt = self.CountOwnedBrandCards()
-        info = self.GetExtraBrandCardPool()
-        if info:
-            pools_all = info.get("pools") or []
-            for p in pools_all:
-                log(f"[大牌] 池: type={p.get('type')} {p.get('name')} "
-                    f"库存={'有' if p.get('has_inventory') else '无'} "
-                    f"今日已抢标记={info.get('today_grabbed')} "
-                    f"(day={info.get('user_day_num')} month={info.get('user_month_num')})")
-
-        # 2. 找 type=99 的场次拿 start_time(只用于对时, 不因状态跳过)
-        pools = (info or {}).get("pools") or []
-        target = next((p for p in pools if int(p.get("type") or 0) == 99), None)
-        if not target:
-            # 池里没有 99 也要打 —— 直接裸打 GrabBrandCard(type=99), 立即执行
-            log("[大牌] 券池无 type=99 场次, 直接裸打 GrabBrandCard(type=99)")
-            self.GrabBrandCardAsync({"type": 99, "name": "通用大牌券", "start_time": 0})
-            after_cnt = self.CountOwnedBrandCards()
-            if after_cnt > before_cnt:
-                log(f"🎉 [大牌] 核验通过: 卡包新增 {after_cnt - before_cnt} 张大牌券")
-                return True
-            log(f"💔 [大牌] 卡包数量未变化({before_cnt} → {after_cnt}), 本次未抢到")
+        self.GetServerTimeOffset()
+        a2 = self.HasExtraBrandCardPool()
+        if a2 and a2.get("has") is False:
+            log("[大牌] 没有额外券池, 跳过")
             return False
-
-        # 3. 按 start_time 等待(纯对时用, 不做任何状态跳过; 超窗就立即打)
-        now = time.time()
-        wait_max = BRAND_WAIT_MAX_MS / 1000.0
-        before = BRAND_BEFORE_MS / 1000.0
-        st_t = target.get("start_time") or 0
-        delay = (st_t - now - before) if st_t else 0
-        if delay > wait_max:
-            log(f"[大牌] 距开抢 {int(delay)}s 超过最大等待 {int(wait_max)}s, 不等待直接开打")
-        elif st_t and st_t > now:
-            wait_seconds = st_t - time.time() - before
-            log(f"[大牌] 目标: {target.get('name')} (type={target.get('type')}) "
-                f"正在等待开抢... (剩余 {wait_seconds:.1f} 秒)")
-            # 粗等: 剩余 > 1 秒时每次睡 0.5 秒
-            while (st_t - time.time() - before) > 1.0:
-                time.sleep(0.5)
-            # 精等: 最后 1 秒用 0.02 秒粒度, 避免睡过头
-            while (st_t - time.time() - before) > 0.0:
-                time.sleep(0.02)
-            log("⚡ 已到开抢时间, 开始冲击")
+        a3 = self.ExtraBrandCardPoolRpc()
+        a4 = (a3 or {}).get("info") or {}
+        a5 = next((p for p in (a4.get("pools") or []) if int(p.get("type") or 0) == BRAND_TYPE), None)
+        if not a5:
+            log(f"[大牌] type={BRAND_TYPE} 未在券池中找到")
+            return False
+        if a4.get("today_grabbed") or a5.get("is_grabbed"):
+            log(f"[大牌] type={BRAND_TYPE} 今日已领取, 跳过")
+            return False
+        before_cnt = self.CountOwnedBrandCards()
+        start_ms = 1000 * (a5.get("start_time") or 0)
+        now_ms = time.time() * 1000
+        if a5.get("has_inventory") is False and (not start_ms or now_ms >= start_ms):
+            log("[大牌] 暂无库存, 跳过")
+            return False
+        wait_ms = start_ms - now_ms - BRAND_BEFORE_MS - getattr(self, "server_offset_ms", 0)
+        if wait_ms > BRAND_WAIT_MAX_MS:
+            log(f"[大牌] 距开抢 {int(wait_ms / 1000)}s 超过最大等待 {BRAND_WAIT_MAX_MS // 1000}s, 放弃本次")
+            return False
+        # 连接预热(JS: 提前 2 发查询, 避免首包吃 TLS 建连延迟)
+        for _ in range(2):
+            try:
+                self.ExtraBrandCardPoolRpc()
+            except Exception:
+                pass
+        if wait_ms > 0:
+            log(f"[大牌] 目标: {a5.get('name')} 等待 {wait_ms:.0f}ms 后抢券 "
+                f"(offset={getattr(self, 'server_offset_ms', 0)}ms)")
+            time.sleep(wait_ms / 1000)
         else:
-            log(f"[大牌] 目标: {target.get('name')} (type={target.get('type')}) 已开放, 立即冲击")
-
-        # 4. 异步打击: 到点后按 150ms 节奏持续发包, 不等响应, 成功即停
-        self.GrabBrandCardAsync(target)
-        # 5. 用抢前/抢后的卡包数量差核验是否真抢到
-        #    (卡包里本来就躺着 svip 保底券, 不能只看"有没有")
+            log(f"[大牌] 目标: {a5.get('name')} 已开放, 立即冲击")
+        saved = self.interval
+        self.interval = 0            # 抢兑窗口内零间隔(实例级, 不动全局)
+        try:
+            for i in range(1, BRAND_ATTEMPTS + 1):
+                self.GrabExtraBrandCard(BRAND_TYPE)
+                if i < BRAND_ATTEMPTS and BRAND_INTERVAL_MS > 0:
+                    time.sleep(BRAND_INTERVAL_MS / 1000)
+        finally:
+            self.interval = saved
+        log(f"[大牌] 已连发 {BRAND_ATTEMPTS} 包 (间隔 {BRAND_INTERVAL_MS}ms)")
+        # 卡包核验
         after_cnt = self.CountOwnedBrandCards()
         if after_cnt > before_cnt:
             log(f"🎉 [大牌] 核验通过: 卡包新增 {after_cnt - before_cnt} 张大牌券")
             return True
         log(f"💔 [大牌] 卡包数量未变化({before_cnt} → {after_cnt}), 本次未抢到")
-        self.GetUserTencentVipInfo()
         return False
+
+    def BrandCardGrabFlow(self, *_args, **_kw):
+        """抢大牌主流程 —— 11-28 重写为 JS BrandCardAuto 移植版, 见 BrandCardAuto。"""
+        return self.BrandCardAuto()
 
     # ---------- 元宝体系 ----------
     def CollectYbPoints(self):
@@ -1055,7 +994,8 @@ class XiaocanMiniUser:
         is_plus = True
         d = self.rpc("SilkwormCommunity", "SilkwormMobileCommunityService.ListFlashSaleExchanges", {
             "silk_id": self.silk_id, "is_plus": is_plus,
-            "new_level": new_level})
+            "new_level": new_level,
+            "user_id": int(self.userId) if self.userId.isdigit() else 0})
         items = []
         for group in ("vip", "svip"):
             for it in ((d.get("list") or {}).get(group) or []):
@@ -1096,15 +1036,14 @@ class XiaocanMiniUser:
         """元宝闪购抢兑主流程: 查列表 → 定位目标商品 → 等 9:00 → 冲击。
 
         目标商品由 XC_YB_GOODS_ID 指定(默认 200 = svip⚡️1元红包, 4000 元宝)。
-        与抢大牌一样, 整个流程不插请求间隔。
+        抢兑窗口内本账号零间隔(实例级, 不动全局 —— 并发账号不再互踩)。
         """
-        global REQUEST_INTERVAL
-        saved = REQUEST_INTERVAL
-        REQUEST_INTERVAL = 0
+        saved = self.interval
+        self.interval = 0
         try:
             return self._yb_flash_grab_inner()
         finally:
-            REQUEST_INTERVAL = saved
+            self.interval = saved
 
     def _yb_flash_grab_inner(self):
         ids = [int(x) for x in re.split(r"[,，\s]+", YB_GOODS_ID) if x.strip().isdigit()]
@@ -1112,6 +1051,7 @@ class XiaocanMiniUser:
             log(f"[闪购] XC_YB_GOODS_ID 无效: {YB_GOODS_ID!r}")
             return False
         yb_now = self.GetYbPoint()
+        self._yb_balance_cache = yb_now   # 供慢响应核验
         log(f"[闪购] 目标 {ids} | 当前元宝 {yb_now}")
         items = self.ListYbFlashSaleExchanges()
         for eid in ids:
@@ -1133,7 +1073,7 @@ class XiaocanMiniUser:
             if start and start > now:
                 wait_s = start - time.time() - (BRAND_BEFORE_MS / 1000.0)
                 if wait_s > BRAND_WAIT_MAX_MS / 1000.0:
-                    log(f"[闪购] id={eid} 距开抢 {wait_s:.0f}s 超过最大等待, 跳过")
+                    log(f"[闪购] id={eid} 距开抢 {wait_s:.0f}s 超过最大等待 {BRAND_WAIT_MAX_MS // 1000}s, 放弃本次")
                     continue
                 log(f"[闪购] 正在等待开抢... (剩余 {wait_s:.1f} 秒)")
                 while (start - time.time() - (BRAND_BEFORE_MS / 1000.0)) > 1.0:
@@ -1211,6 +1151,15 @@ class XiaocanMiniUser:
                 k = r.get("code") if r.get("code") is not None else "ERR"
                 codes[k] = codes.get(k, 0) + 1
         log(f"💔 [闪购] {sent['n']} 发全部未成功 | 分布: {codes}")
+        # 慢响应兜底(P2-8): 全部未确认成功时查一次元宝余额变化, 判断是否实际兑换成功
+        try:
+            before = self._yb_balance_cache
+            after = self.GetYbPoint()
+            if before is not None and after is not None and after < before:
+                log(f"🎉 [闪购] 慢响应核验: 元宝 {before}→{after}, 实际已兑换成功!")
+                return True
+        except Exception:
+            pass
         return False
 
     def GetRedPackRainEventsByDate(self, date):
@@ -1291,6 +1240,9 @@ class XiaocanMiniUser:
         if not RAIN_ENABLE:
             log("[红包雨] 已关闭")
             return
+        if self.red_pack_rain_done:
+            log("[红包雨] 本次运行已完成, 跳过(防重复进入)")
+            return
         click_num = RAIN_CLICK_NUM
         wait_max = 120.0
         before = 0.2
@@ -1355,6 +1307,13 @@ class XiaocanMiniUser:
                 log("[红包雨] 报名失败, 放弃")
                 return
         self.RedPackRainGrabNum(ev.get("event_id"), click_num)
+        # 抢包后复查实际所得(JS 行为): RedPackRainGrabNum 只回一包, 实际可能多包
+        info2 = self.GetRedPackRainEventInfo(ev.get("event_id"))
+        ue2 = (info2 or {}).get("user_event") or {}
+        items = ue2.get("items") or []
+        if items:
+            log(f"[红包雨] 最终所得 {len(items)} 项: "
+                + ", ".join(f"{(it.get('name') or '?')}x{it.get('prize_value') or '?'}" for it in items[:5]))
         self.red_pack_rain_done = True
         self.RedPackRainAdAuto(click_num)
 
@@ -1371,6 +1330,7 @@ def run_daily_account(u):
     log(f"\n-------------账号{u.index}-------------")
     log(f"[INFO] 「{info.get('nickname', u.userName)}」登录成功!")
 
+    u.RiskPhoneCheck()
     u.BindInviter()
     u.SignInLottery()
     u.SignInInfo()
@@ -1386,17 +1346,18 @@ def run_daily_account(u):
     # 拉任务列表(积分任务; 元宝抽奖/元宝兑换要按这份列表判断做没做)
     tasks = u.GetDailyTaskList()
 
-    # 元宝抽奖: 只在「元宝抽奖」任务未完成时才抽(完成就不用抽, 否则白扣元宝)
+    # 元宝抽奖: 只在「元宝抽奖」任务存在且未完成时才抽
+    # (任务不存在也不抽 —— 抽了没任务加成, 纯扣元宝; JS 原版无此功能, 按"不发无效请求"原则处理)
     yb_task = next((t for t in tasks if (t.get("brief_title") or "").find("元宝抽奖") >= 0), None)
-    yb_done = False
+    yb_todo = False
     if yb_task:
         done = int(yb_task.get("completed_num") or 0)
         limit = int(yb_task.get("limit_num") or 0)
-        yb_done = bool(limit and done >= limit)
-        log(f"[元宝抽奖] 任务进度 {done}/{limit} → {'已完成, 不抽' if yb_done else '未完成, 去抽'}")
+        yb_todo = bool(limit and done < limit)
+        log(f"[元宝抽奖] 任务进度 {done}/{limit} → {'未完成, 去抽' if yb_todo else '已完成, 不抽'}")
     else:
-        log("[元宝抽奖] 任务列表中无此项, 跳过")
-    if not yb_done:
+        log("[元宝抽奖] 任务列表中无此项, 不抽(抽了无任务加成)")
+    if yb_todo:
         yb_info = u.YbLotteryInfo()
         yb_cost = int((yb_info or {}).get("cost") or 0)
         if yb_cost and u.GetYbPoint() >= yb_cost:
@@ -1419,6 +1380,7 @@ def run_daily_account(u):
     #           疑似服务端文案未区分; 保留发送, 以实际加次数为准)
     #   type=2  分享 (if_shared)
     # type=3,5,6 不存在(请求参数错误), 不发。
+    # 做完任务加次数后必须重新查 LotteryInfo(旧数据不含刚加的次数, 会少抽)
     li = u.GetLotteryInfo()
     info = (li or {}).get("lottery_info") or {}
     TYPE_BY_FLAG = {
@@ -1432,6 +1394,9 @@ def run_daily_account(u):
     if todo:
         for flag, t in todo:
             ok, _ = u.AddLotteryTimes(t)
+        # 关键: 做完任务后重新查 LotteryInfo, 否则用的是加次数前的旧数据(P2-5)
+        li = u.GetLotteryInfo()
+        info = (li or {}).get("lottery_info") or {}
     else:
         log("[抽奖次数] 所有任务今日已完成")
 
@@ -1493,9 +1458,7 @@ def main():
     hour, current_min = now_lt.tm_hour, now_lt.tm_min
     if BRAND_ENABLE:
         now_minutes = hour * 60 + current_min
-        yb_open = YB_FLASH_HOUR * 60 + YB_FLASH_MIN        # 540 = 9:00
-        brand_open = BRAND_HOUR * 60 + BRAND_MIN           # 570 = 9:30
-        # 元宝闪购: 8:40 ~ 9:05 之间启动都算
+        # 元宝闪购: 8:40 ~ 9:05 之间启动都算(等待上限 10 分钟足够覆盖 8:57 启动)
         if 540 - 20 <= now_minutes <= 545:
             grab_mode = True
             grab_target = "yb"
