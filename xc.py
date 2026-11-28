@@ -9,27 +9,18 @@ cron: 10 8 * * *
 ==================================
 小蚕霸王餐
 ==================================
-小蚕 每日自动任务脚本，多账号支持，功能:
+小蚕 App 每日自动任务脚本，多账号支持，功能:
 
   登录验证 → 每日签到抽奖 → 开宝箱
   → 元宝领取 + 元宝闪购兑换(可配抢购) → 挑战赛自动报名
-  → 日常任务×20 (含看广告加抽奖次数) → 抽奖×6 + 额外抽奖×2
+  → 日常任务×20 (含看广告加抽奖次数) → 抽奖(lucky_times 驱动) + 额外抽奖×2
+  → 大牌券抢兑(9:30 场, 照 JS 原版 BrandCardAuto 移植)
   → 红包雨(自动选场次/等待开场/报名/抢包/广告加奖)
   → 余额≥1元 自动提现到支付宝(默认关)
   → 汇总推送钉钉机器人(可配)
 
  token 过期自动检测并钉钉提醒。
- 依赖: pip install requests
-
----------- 双端模式 ----------
-同一套 RPC 协议(网关/签名/token 完全一致), 伪装成两种客户端:
-  mini (默认)   微信小程序特征: x-platform=mini, 微信 WebView UA,
-                Referer=servicewechat.com, body 注入 app_id=20,
-                默认请求间隔 3 秒(降低风控)
-  app           安卓 APP 特征: x-platform=Android, xcapp UA, body 不带 app_id,
-                默认请求间隔 1 秒
-凭证两种模式通用(x-sivir token / x-teemo silk_id / x-vayne userId 不变),
-抓 APP 或抓小程序的包都能用。
+ 依赖: pip install curl_cffi (腾讯云 WAF 按 TLS 指纹拦截, 必须浏览器指纹)
 
 ---------- 青龙面板使用 ----------
 脚本管理新建 xc.py，环境变量添加:
@@ -40,17 +31,21 @@ cron: 10 8 * * *
   XCBWC_DATA           账号数据, JSON 数组:
                        [{"userId":"123456","teemo":"1234567","token":"eyJ...","userName":"昵称"}, ...]
                        userId = x-vayne, teemo = x-teemo(silk_id), token = x-sivir, 抓包请求头复制即可
-  XCBWC_PLATFORM       端模式: mini(默认)/app
+                       可选字段: phone_middle = 手机号中间4位(风控校验用, 缺省跳过风控)
   XCBWC_WALLET         true=余额≥1元自动提现支付宝, 默认 false 不提现
-  XCBWC_INTERVAL       请求间隔秒数, mini 模式默认 3.0, app 模式默认 1.0
-  XCBWC_BASE_URL       RPC 网关, 默认 https://gw.xiaocantech.com/rpc
-  XCBWC_UA             User-Agent, mini 模式默认微信 WebView, app 模式默认 xcapp
-  XCBWC_VERSION        x-version, mini 默认 3.22.9.93, app 默认 3.18.3.6
-  XCBWC_REFERER        mini 模式 Referer, 默认 servicewechat.com/wx52ae177248081591/824
-  XCBWC_MODEL          x-model, mini 默认 "PKR110 OnePlus", app 模式不设
-  XCBWC_APP_SR         x-app-sr, mini 默认 20, app 模式默认不设
-  XCBWC_CHANNEL        x-channel, 默认不设
-  XCBWC_APP_ID         body 注入的 app_id, mini 默认 20
+  XCBWC_INTERVAL       请求间隔秒数, 默认 1.0 (太低可能触发风控)
+  XCBWC_BASE_URL       RPC 网关, 默认 https://gwh.xiaocantech.com/rpc
+  XCBWC_UA             User-Agent, 默认 3.18.3.6 安卓 WebView
+  XCBWC_VERSION        x-version, 默认 3.18.3.6
+  XCBWC_APP_SR         x-app-sr, 3.22.x 抓包为 16, 老版不设
+  XCBWC_CHANNEL        x-channel, 3.22.x 抓包为 YYB, 老版不设
+  XCBWC_PHONE_MIDDLE   手机号中间4位(全局兜底, 账号字段优先)
+  XCBWC_BRAND_ENABLE   true=开大牌券抢兑, 默认 true
+  XCBWC_BRAND_TYPE     大牌券 type, 默认 99
+  XCBWC_BRAND_ATTEMPTS 大牌连发次数, 默认 5
+  XCBWC_BRAND_INTERVAL_MS 大牌连发间隔 ms, 默认 100
+  XCBWC_BRAND_BEFORE_MS 提前量 ms, 默认 300
+  XCBWC_BRAND_WAIT_MAX_MS 距开抢最大等待 ms, 默认 180000
   XCBWC_DD_BOT_TOKEN   钉钉机器人 access_token, 不设不推送
   XCBWC_DD_BOT_SECRET  钉钉机器人加签密钥 SEC 开头
   XCBWC_YB_FLASH_IDS   元宝闪购要抢的 exchange_id, 逗号分隔, 不设只看列表不兑换
@@ -81,43 +76,31 @@ except ImportError:
     HTTP_IMPERSONATE = None
 import requests
 
-BASE_URL = os.getenv("XCBWC_BASE_URL", "https://gw.xiaocantech.com/rpc")
-# 端模式: mini=微信小程序(默认) / app=安卓APP
-# 两者协议同一套(RPC 网关/签名/token 通用), 区别仅在请求头特征与 body 的 app_id 字段
-PLATFORM = os.getenv("XCBWC_PLATFORM", "mini").strip().lower()
-if PLATFORM == "mini":
-    UA = os.getenv("XCBWC_UA",
-          "Mozilla/5.0 (Linux; Android 16; PKR110 Build/AP3A.240617.008; wv) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/156.0.8078.79 "
-          "Mobile Safari/537.36 XWEB/1560023 MMWEBSDK/20260902 MMWEBID/3250 "
-          "MicroMessenger/8.0.80.3220(0x280050C7) WeChat/arm64 Weixin NetType/WIFI "
-          "Language/zh_CN ABI/arm64 MiniProgramEnv/android")
-    X_VERSION = os.getenv("XCBWC_VERSION", "3.22.9.93")
-    REFERER = os.getenv("XCBWC_REFERER",
-                        "https://servicewechat.com/wx52ae177248081591/824/page-frame.html")
-    X_MODEL = os.getenv("XCBWC_MODEL", "PKR110 OnePlus")
-    X_APP_SR = os.getenv("XCBWC_APP_SR", "20")
-    X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")
-    APP_ID = int(os.getenv("XCBWC_APP_ID", "20"))
-    DEFAULT_INTERVAL = 3.0     # 小程序模式默认 3 秒/请求(降低风控)
-else:
-    UA = os.getenv("XCBWC_UA",
-          "Mozilla/5.0 (Linux; Android 15; PKR110 Build/AP3A.240617.008; wv) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.159 "
-          "Mobile Safari/537.36 AgentWeb/5.0.8  UCBrowser/11.6.4.950  xcapp;3.18.3.6;Android")
-    X_VERSION = os.getenv("XCBWC_VERSION", "3.18.3.6")
-    REFERER = os.getenv("XCBWC_REFERER", "")
-    X_MODEL = os.getenv("XCBWC_MODEL", "")
-    X_APP_SR = os.getenv("XCBWC_APP_SR", "")        # 如 16 (3.22.x 抓包)
-    X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")      # 如 YYB
-    APP_ID = 0                                      # APP 模式 body 不带 app_id
-    DEFAULT_INTERVAL = 1.0
+BASE_URL = os.getenv("XCBWC_BASE_URL", "https://gwh.xiaocantech.com/rpc")
+UA = os.getenv("XCBWC_UA",
+      "Mozilla/5.0 (Linux; Android 15; PKR110 Build/AP3A.240617.008; wv) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.159 "
+      "Mobile Safari/537.36 AgentWeb/5.0.8  UCBrowser/11.6.4.950  xcapp;3.18.3.6;Android")
+X_VERSION = os.getenv("XCBWC_VERSION", "3.18.3.6")
+X_APP_SR = os.getenv("XCBWC_APP_SR", "")        # 如 16 (3.22.x 抓包)
+X_CHANNEL = os.getenv("XCBWC_CHANNEL", "")      # 如 YYB
 CITY_CODE = 4501                      # 挑战赛城市码
 DEFAULT_CITY = "330109"
 RECOMMEND_ID = 12159598643
 
 IS_WALLET = os.getenv("XCBWC_WALLET", "false") != "false"
-REQUEST_INTERVAL = float(os.getenv("XCBWC_INTERVAL", str(DEFAULT_INTERVAL)))
+REQUEST_INTERVAL = float(os.getenv("XCBWC_INTERVAL", "1.0"))
+
+# 大牌券抢兑(JS 原版 BrandCardAuto 参数)
+BRAND_ENABLE = os.getenv("XCBWC_BRAND_ENABLE", "true").lower() != "false"
+BRAND_TYPE = int(os.getenv("XCBWC_BRAND_TYPE", "99"))
+BRAND_ATTEMPTS = max(1, int(os.getenv("XCBWC_BRAND_ATTEMPTS", "5")))
+BRAND_INTERVAL_MS = max(0, int(os.getenv("XCBWC_BRAND_INTERVAL_MS", "100")))
+BRAND_BEFORE_MS = max(0, int(os.getenv("XCBWC_BRAND_BEFORE_MS", "300")))
+BRAND_WAIT_MAX_MS = int(os.getenv("XCBWC_BRAND_WAIT_MAX_MS", "180000"))
+BRAND_HOUR = 9            # 大牌券每天 09:30 开抢
+BRAND_MIN = 30
+PHONE_MIDDLE_GLOBAL = os.getenv("XCBWC_PHONE_MIDDLE", "")
 
 # 钉钉机器人 (不设则不发)
 DD_BOT_TOKEN = os.getenv("XCBWC_DD_BOT_TOKEN", "")
@@ -214,10 +197,13 @@ class XiaocanUser:
         self.token = acc.get("token") or acc.get("x-sivir") or ""
         self.userName = acc.get("userName") or self.userId
         self.city = str(acc.get("city") or DEFAULT_CITY)
+        self.interval = REQUEST_INTERVAL    # 每账号独立间隔(抢兑时改这里, 不动全局)
         self.session_id = acc.get("sessionId") or str(uuid.uuid4())
+        self.phone_middle = str(acc.get("phone_middle") or PHONE_MIDDLE_GLOBAL or "").strip()
         self.ck_status = True
         self.draw_status = True
         self.red_pack_rain_done = False
+        self._interval_lock = None     # 抢兑时每账号独立的间隔控制
         self.headers = {
             "accept": "application/json, text/plain, */*",
             "user-agent": UA,
@@ -227,14 +213,10 @@ class XiaocanUser:
             "x-version": X_VERSION,
             "x-vayne": self.userId,
             "x-sivir": self.token,
-            "x-platform": "mini" if PLATFORM == "mini" else "Android",
+            "x-platform": "Android",
             "x-city": self.city,
             "x-session-id": self.session_id,
         }
-        if PLATFORM == "mini":
-            self.headers["referer"] = REFERER
-        if X_MODEL:
-            self.headers["x-model"] = X_MODEL
         if X_APP_SR:
             self.headers["x-app-sr"] = X_APP_SR
         if X_CHANNEL:
@@ -252,10 +234,7 @@ class XiaocanUser:
         ).hexdigest()
         return {"x-ashe": ashe, "x-garen": ts, "x-nami": nami}
 
-    def rpc(self, server, method, body):
-        # 小程序模式: 所有 body 统一注入 app_id=20 (抓包实证, APP 模式不带)
-        if PLATFORM == "mini" and isinstance(body, dict) and "app_id" not in body:
-            body = {**body, "app_id": APP_ID}
+    def rpc(self, server, method, body, no_delay=False):
         headers = {**self.headers, "servername": server, "methodname": method,
                    **self._sign_headers(self.teemo, server, method)}
         # TLS 指纹: 有 curl_cffi 用之(绕 WAF), 无则回落 requests(会被 403)
@@ -281,12 +260,11 @@ class XiaocanUser:
             log(f"[ERROR] {method}: {e}")
             return {}
         finally:
-            time.sleep(REQUEST_INTERVAL)
+            if not no_delay:
+                time.sleep(self.interval)
 
-    def yb_rpc(self, server, method, body):
-        """元宝社区通道: H5 头。小程序模式下 app_id 同样注入。"""
-        if PLATFORM == "mini" and isinstance(body, dict) and "app_id" not in body:
-            body = {**body, "app_id": APP_ID}
+    def yb_rpc(self, server, method, body, no_delay=False):
+        """元宝社区通道: H5 头。"""
         headers = {**self.headers,
                    "origin": "https://gw.djtaoke.cn",
                    "referer": "https://gw.djtaoke.cn/",
@@ -301,12 +279,21 @@ class XiaocanUser:
             if _curl_requests:
                 kwargs["impersonate"] = HTTP_IMPERSONATE
             r = send(BASE_URL, **kwargs)
-            return r.json() if r.status_code == 200 else {}
+            data = r.json() if r.status_code == 200 else {}
+            if is_cookie_expired(data) and not getattr(self, "_expired_notified", False):
+                self._expired_notified = True
+                self.ck_status = False
+                name = self.userName or self.userId or f"账号{self.index}"
+                msg = f"[{name}] Cookie 已过期，请重新登录更新 xcbwc_data"
+                log(msg)
+                dingtalk_send(f"{SCRIPT_NAME} Cookie 失效通知\n\n{msg}")
+            return data
         except Exception as e:
             log(f"[ERROR] {method}: {e}")
             return {}
         finally:
-            time.sleep(REQUEST_INTERVAL)
+            if not no_delay:
+                time.sleep(self.interval)
 
     # ---------- 基础方法 ----------
     def GetUserInfo(self):
@@ -405,11 +392,12 @@ class XiaocanUser:
 
     def SignInLottery(self):
         d = self.rpc("SilkwormVip", "VipRightsService.SignInLottery", {"silk_id": self.silk_id})
-        data = d.get("data") or {}
-        if data:
-            score = (data.get("score") or 0) / 100
-            prices = data.get("price") or []
-            log(f"[签到] 成功! 奖 {score} 充值金" + (f" {prices[0]}元券" if prices else ""))
+        # score/price 在响应顶层(实测: data 层不存在, 旧代码读 data.score 恒为 0)
+        if (d.get("status") or {}).get("code") == 0:
+            score = (d.get("score") or 0) / 100
+            prices = d.get("price") or []
+            p0 = (prices[0] or {}).get("name") if prices and isinstance(prices[0], dict) else (prices[0] if prices else "")
+            log(f"[签到] 成功! 奖 {score} 成长值" + (f" {p0}" if p0 else ""))
         else:
             st = d.get("status", {})
             log(f"[签到] {st.get('msg', st.get('code'))}")
@@ -419,6 +407,20 @@ class XiaocanUser:
             "inviter_silk_id": RECOMMEND_ID,
             "user_silk_id": self.silk_id,
         })
+
+    def RiskPhoneCheck(self):
+        """手机号中间四位风控校验(JS 原版 RiskPhoneCheck 移植)。
+
+        签到/开宝箱前调用。phone_middle 缺省时跳过(JS 同行为)。
+        """
+        if not self.phone_middle:
+            return
+        if getattr(self, "_risk_checked", False):
+            return
+        d = self.rpc("Brs", "RiskCheckService.PhoneCheck", {
+            "silk_id": self.silk_id, "number": self.phone_middle})
+        self._risk_checked = bool(d and d.get("pass"))
+        log(f"[风控] 手机中间四位校验: {'pass' if self._risk_checked else json.dumps(d.get('status') or d, ensure_ascii=False)[:80]}")
 
     # ---------- 元宝闪购 ----------
     def ListYbFlashSaleExchanges(self):
@@ -453,11 +455,15 @@ class XiaocanUser:
         return d
 
     def CollectYbPoints(self):
-        d = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2", {"silk_id": self.silk_id})
+        d = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2",
+                        {"silk_id": self.silk_id, "user_id": int(self.userId) if self.userId.isdigit() else 0})
         data = d.get("data") or {}
+        self._yb_balance_cache = data.get("yb_point")   # 供慢响应核验用
         log(f"[元宝] 余额 {data.get('yb_point', 0)} 待领取 {data.get('unreceived_points', 0)}")
         if data.get("unreceived_points"):
-            d2 = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.CollectPoints", {"silk_id": self.silk_id})
+            d2 = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.CollectPoints",
+                             {"silk_id": self.silk_id,
+                              "user_id": int(self.userId) if self.userId.isdigit() else 0})
             st = d2.get("status") or {}
             log(f"[元宝] 领取返回: {json.dumps(st, ensure_ascii=False)[:100]}")
             after = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2", {"silk_id": self.silk_id})
@@ -471,9 +477,9 @@ class XiaocanUser:
             log("[元宝闪购] 未配置 XCBWC_YB_FLASH_IDS, 仅展示列表不兑换")
             return
         wait_max = float(os.getenv("XCBWC_YB_FLASH_WAIT_MAX_MS", "180000")) / 1000
-        before = float(os.getenv("XCBWC_YB_FLASH_BEFORE_MS", "200")) / 1000
-        attempts = max(1, int(os.getenv("XCBWC_YB_FLASH_ATTEMPTS", "3")))
-        interval = float(os.getenv("XCBWC_YB_FLASH_INTERVAL_MS", "300")) / 1000
+        before = float(os.getenv("XCBWC_YB_FLASH_BEFORE_MS", "300")) / 1000
+        attempts = max(1, int(os.getenv("XCBWC_YB_FLASH_ATTEMPTS", "10")))
+        interval = float(os.getenv("XCBWC_YB_FLASH_INTERVAL_MS", "100")) / 1000
         for eid in ids:
             item = next((x for x in items if int(x.get("exchange_id") or 0) == eid), None)
             if not item:
@@ -487,18 +493,41 @@ class XiaocanUser:
                 continue
             delay = (start - now - before) if start else 0
             if delay > wait_max:
-                log(f"[闪购] id={eid} 距开抢 {int(delay)}s 超过最大等待, 跳过")
+                # 统一策略: 超等待上限放弃本次, 绝不提前提交
+                log(f"[闪购] id={eid} 距开抢 {int(delay)}s 超过最大等待 {int(wait_max)}s, 放弃本次")
                 continue
             if delay > 0:
                 log(f"[闪购] id={eid} 等待 {delay:.1f}s 后提交")
                 time.sleep(delay)
+            got = False
             for att in range(1, attempts + 1):
                 d = self.ExchangeYbGoodsV2(eid)
                 if (d.get("status") or {}).get("code") == 0:
                     log(f"[闪购] id={eid} 第{att}次提交成功!")
+                    got = True
                     break
                 if att < attempts:
                     time.sleep(interval)
+            if not got:
+                # 慢响应兜底: 全部未确认成功时查一次实际到账再下结论
+                self._verify_yb_exchange(eid, item)
+
+    def _verify_yb_exchange(self, eid, item):
+        """连发全部未确认成功后, 查元宝余额变化判断是否慢响应成功。"""
+        try:
+            before = self._yb_balance_cache
+        except AttributeError:
+            before = None
+        d = self.yb_rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2",
+                        {"silk_id": self.silk_id,
+                         "user_id": int(self.userId) if self.userId.isdigit() else 0})
+        after = (d.get("data") or {}).get("yb_point")
+        if before is not None and after is not None:
+            need = int(item.get("community_silk") or 0)
+            if after <= before - need:
+                log(f"🎉 [闪购] id={eid} 慢响应核验: 元宝 {before}→{after}, 实际已兑换成功!")
+                return
+        log(f"[闪购] id={eid} 核验后确认未抢到 (元宝 {before} → {after})")
 
     # ---------- 红包雨 ----------
     def GetRedPackRainEventsByDate(self, date):
@@ -645,6 +674,129 @@ class XiaocanUser:
     def GetActivityTaskStatusV2(self):
         return self.yb_rpc("ActivityTask", "ActivityTaskMobileService.UserTaskV2", {"silk_id": self.silk_id})
 
+    # ---------- 大牌券(JS 原版 BrandCardAuto 移植) ----------
+    def BrandCardRpc(self, method, body, no_delay=False):
+        """大牌券专用通道(JS BrandCardRpc): APP 特征 + hzaiguojiang origin。"""
+        headers = {**self.headers,
+                   "origin": "https://gw.hzaiguojiang.com",
+                   "referer": "https://gw.hzaiguojiang.com/",
+                   "content-type": "application/json",
+                   "servername": "SilkwormVip",
+                   "methodname": method,
+                   **self._sign_headers(self.teemo, "SilkwormVip", method)}
+        try:
+            send = _curl_requests.post if _curl_requests else requests.post
+            kwargs = {"json": body, "headers": headers, "timeout": 20}
+            if _curl_requests:
+                kwargs["impersonate"] = HTTP_IMPERSONATE
+            r = send(BASE_URL, **kwargs)
+            return r.json() if r.status_code == 200 else {}
+        except Exception as e:
+            log(f"[ERROR] {method}: {e}")
+            return {}
+        finally:
+            if not no_delay:
+                time.sleep(self.interval)
+
+    def HasExtraBrandCardPool(self):
+        return self.BrandCardRpc("VipRightsService.HasExtraBrandCardPool", {"silk_id": self.silk_id})
+
+    def ExtraBrandCardPool(self):
+        return self.BrandCardRpc("VipRightsService.ExtraBrandCardPool", {"silk_id": self.silk_id})
+
+    def GrabExtraBrandCard(self, btype):
+        d = self.BrandCardRpc("VipRightsService.GrabExtraBrandCard",
+                              {"silk_id": self.silk_id, "type": int(btype)}, no_delay=True)
+        card_id = ((d or {}).get("info") or {}).get("card_id")
+        st = (d or {}).get("status") or {}
+        log(f"[大牌] 抢券 type={btype} 返回: {json.dumps(st, ensure_ascii=False)[:120]}"
+            + (f" card_id={card_id}" if card_id else ""))
+        return d
+
+    def GetServerTimeOffset(self):
+        """服务器时钟偏差 ms(JS GetServerTimeOffset): 用响应 Date 头校准开抢等待。"""
+        try:
+            t0 = time.time()
+            r = self.HasExtraBrandCardPool()
+            t1 = time.time()
+            # curl_cffi 响应头
+            hd = getattr(r, "headers", None) if not isinstance(r, dict) else None
+            date_str = ""
+            if hd:
+                date_str = hd.get("Date") or hd.get("date") or ""
+            if not date_str:
+                self.server_offset_ms = 0
+                return 0
+            from email.utils import parsedate_to_datetime
+            server_ms = parsedate_to_datetime(date_str).timestamp() + (t1 - t0) / 2
+            self.server_offset_ms = int((server_ms - t1) * 1000)
+            log(f"[大牌] 服务器时钟偏差 {self.server_offset_ms}ms")
+            return self.server_offset_ms
+        except Exception:
+            self.server_offset_ms = 0
+            return 0
+
+    def BrandCardAuto(self):
+        """大牌券抢兑主流程(JS BrandCardAuto 逐行对照移植)。"""
+        if not BRAND_ENABLE:
+            log("[大牌] 未开启(XCBWC_BRAND_ENABLE=false), 跳过")
+            return False
+        self.GetServerTimeOffset()
+        a2 = self.HasExtraBrandCardPool()
+        if a2 and a2.get("has") is False:
+            log("[大牌] 没有额外券池, 跳过")
+            return False
+        a3 = self.ExtraBrandCardPool()
+        a4 = (a3 or {}).get("info") or {}
+        a5 = next((p for p in (a4.get("pools") or []) if int(p.get("type") or 0) == BRAND_TYPE), None)
+        if not a5:
+            log(f"[大牌] type={BRAND_TYPE} 未在券池中找到")
+            return False
+        if a4.get("today_grabbed") or a5.get("is_grabbed"):
+            log(f"[大牌] type={BRAND_TYPE} 今日已领取, 跳过")
+            return False
+        start_ms = 1000 * (a5.get("start_time") or 0)
+        now_ms = time.time() * 1000
+        if a5.get("has_inventory") is False and (not start_ms or now_ms >= start_ms):
+            log("[大牌] 暂无库存, 跳过")
+            return False
+        wait_ms = start_ms - now_ms - BRAND_BEFORE_MS - getattr(self, "server_offset_ms", 0)
+        if wait_ms > BRAND_WAIT_MAX_MS:
+            log(f"[大牌] 距开抢 {int(wait_ms / 1000)}s 超过最大等待 {BRAND_WAIT_MAX_MS // 1000}s, 放弃本次")
+            return False
+        # 连接预热(JS: 提前打 2 发查询避免首包吃 TLS 建连延迟)
+        for _ in range(2):
+            try:
+                self.ExtraBrandCardPool()
+            except Exception:
+                pass
+        if wait_ms > 0:
+            log(f"[大牌] 等待 {wait_ms:.0f}ms 后抢券 (offset={getattr(self, 'server_offset_ms', 0)}ms)")
+            time.sleep(wait_ms / 1000)
+        saved = self.interval
+        self.interval = 0            # 抢兑窗口内零间隔(实例级, 不动全局)
+        try:
+            for i in range(1, BRAND_ATTEMPTS + 1):
+                self.GrabExtraBrandCard(BRAND_TYPE)
+                if i < BRAND_ATTEMPTS and BRAND_INTERVAL_MS > 0:
+                    time.sleep(BRAND_INTERVAL_MS / 1000)
+        finally:
+            self.interval = saved
+        log(f"[大牌] 已连发 {BRAND_ATTEMPTS} 包 (间隔 {BRAND_INTERVAL_MS}ms), 以卡包核验为准")
+        return True
+
+    def GetOwnedBrandCards(self):
+        """已持有大牌券列表(卡包核验)。"""
+        d = self.rpc("SilkwormCard", "SilkwormCardService.GetUserCardList", {
+            "silk_id": self.silk_id, "status": 0, "offset": 0, "number": 1000,
+            "card_types": [13, 3], "card_ids": None})
+        cards = []
+        for it in (d.get("list") or []):
+            c = it.get("card") or {}
+            if "大牌" in (c.get("name") or ""):
+                cards.append(it)
+        return cards
+
 
 # ---------- 主流程 ----------
 def run_account(u):
@@ -654,6 +806,7 @@ def run_account(u):
     log(f"\n-------------账号{u.index}-------------")
     log(f"[INFO] 「{info.get('nickname', u.userName)}」登录成功!")
 
+    u.RiskPhoneCheck()
     u.BindInviter()
     u.SignInLottery()
     u.OpenBox()
@@ -710,6 +863,30 @@ def run_account(u):
 def main():
     accounts = env_data()
     log(f"共 {len(accounts)} 个账号")
+
+    # 抢兑模式判定(与 xc_mini 一致): 9:05 ~ 9:35 启动 → 只抢大牌券
+    # (元宝闪购走日常流程里的 YbFlashSale, 由 XCBWC_YB_FLASH_IDS 控制)
+    now_lt = time.localtime()
+    now_minutes = now_lt.tm_hour * 60 + now_lt.tm_min
+    if BRAND_ENABLE and 545 < now_minutes <= 575:
+        log(f"⏰ [抢兑模式] 目标: 大牌券 (开抢 {BRAND_HOUR:02d}:{BRAND_MIN:02d})")
+        ok = 0
+        for i, acc in enumerate(accounts, 1):
+            try:
+                u = XiaocanUser(acc, i)
+                info = u.GetUserInfo()
+                if not u.ck_status:
+                    continue
+                log(f"\n-------------账号{u.index} [抢大牌]-------------")
+                log(f"[INFO] 「{info.get('nickname', u.userName)}」登录成功!")
+                if u.BrandCardAuto():
+                    ok += 1
+            except Exception as e:
+                log(f"[账号{i}] 抢兑异常: {e}")
+        log(f"\n共{len(accounts)}账号抢大牌结束, 成功{ok}个")
+        dingtalk_send(f"{SCRIPT_NAME} 大牌券抢兑结束\n\n" + "\n".join(NOTIFY))
+        return
+
     ok = 0
     for i, acc in enumerate(accounts, 1):
         try:
